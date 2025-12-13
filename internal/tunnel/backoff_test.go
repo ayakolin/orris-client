@@ -72,8 +72,8 @@ func TestBackoff_Jitter(t *testing.T) {
 	}
 
 	// Run multiple times to verify jitter is applied
-	min := 8 * time.Second   // 10s - 20%
-	max := 12 * time.Second  // 10s + 20%
+	min := 8 * time.Second  // 10s - 20%
+	max := 12 * time.Second // 10s + 20%
 
 	for i := 0; i < 100; i++ {
 		b.Reset()
