@@ -19,6 +19,25 @@ type Agent struct {
 	client    *api.Client
 	collector *status.Collector
 
+	// Lock ordering to prevent deadlocks: rulesMu -> forwardersMu -> tunnelsMu
+	// CRITICAL: Always acquire locks in this order when multiple locks are needed.
+	// Never acquire locks in reverse order to avoid circular wait conditions.
+	//
+	// Lock acquisition rules:
+	// 1. Single lock: Can acquire any lock independently
+	// 2. Multiple locks: MUST follow the ordering above
+	// 3. Keep critical sections as small as possible
+	// 4. Release locks as soon as possible to reduce contention
+	//
+	// Examples:
+	//   ✓ Correct: rulesMu.Lock() -> forwardersMu.Lock() -> tunnelsMu.Lock()
+	//   ✗ Wrong:   forwardersMu.Lock() -> rulesMu.Lock() (violates ordering)
+	//   ✗ Wrong:   tunnelsMu.Lock() -> forwardersMu.Lock() (violates ordering)
+
+	rulesMu     sync.RWMutex
+	rules       []forward.Rule
+	clientToken string // agent's own token for tunnel handshake (from API response)
+
 	forwardersMu sync.RWMutex
 	forwarders   map[string]forwarder.Forwarder
 
@@ -26,11 +45,6 @@ type Agent struct {
 	tunnels   map[string]*tunnel.Client // ruleID -> tunnel
 
 	tunnelServer  *tunnel.Server
-	signingSecret string // also used as shared secret for key derivation
-	clientToken   string // agent's own token for tunnel handshake (from API response)
-	rules         []forward.Rule
-	rulesMu       sync.RWMutex
-
 	configVersion uint64 // current config version from server
 
 	ctx      context.Context

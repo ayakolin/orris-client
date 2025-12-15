@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -29,11 +30,10 @@ type Client struct {
 	token      string
 	ruleID     string
 	conn       *websocket.Conn
+	connected  atomic.Bool // tracks actual connection state
 
-	writeMu      sync.Mutex
-	handler      DataHandler
-	cipher       Cipher // session cipher (created after key exchange)
-	sharedSecret string // shared secret for key derivation
+	writeMu sync.Mutex
+	handler DataHandler
 
 	backoff              *Backoff
 	heartbeatInterval    time.Duration
@@ -82,14 +82,6 @@ func WithInitialRetry(maxRetries int) ClientOption {
 	}
 }
 
-// WithSharedSecret sets the shared secret for session key derivation.
-// This enables forward-secure encryption with per-connection session keys.
-func WithSharedSecret(secret string) ClientOption {
-	return func(c *Client) {
-		c.sharedSecret = secret
-	}
-}
-
 // NewClient creates a new tunnel client.
 func NewClient(endpoint, token, ruleID string, opts ...ClientOption) *Client {
 	c := &Client{
@@ -131,6 +123,9 @@ func (c *Client) Stop() error {
 		c.cancel()
 	}
 
+	// Mark connection as disconnected before closing
+	c.connected.Store(false)
+
 	// Hold write lock before closing to prevent concurrent write
 	c.writeMu.Lock()
 	if c.conn != nil {
@@ -145,6 +140,8 @@ func (c *Client) Stop() error {
 }
 
 // IsConnected returns true if the tunnel is connected.
+// It uses atomic operation to check the connection state without holding locks,
+// providing thread-safe and accurate connection status.
 func (c *Client) IsConnected() bool {
-	return c.conn != nil
+	return c.connected.Load()
 }

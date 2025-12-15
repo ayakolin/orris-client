@@ -16,14 +16,6 @@ func (c *Client) SendMessage(msg *Message) error {
 		return fmt.Errorf("encode message: %w", err)
 	}
 
-	// Encrypt if cipher is configured
-	if c.cipher != nil {
-		data, err = c.cipher.Encrypt(data)
-		if err != nil {
-			return fmt.Errorf("encrypt message: %w", err)
-		}
-	}
-
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -53,28 +45,21 @@ func (c *Client) readLoop() {
 		if err != nil {
 			logger.Error("tunnel read error", "error", err)
 
+			// Clear connection state immediately to prevent SendMessage from using broken conn
+			c.connected.Store(false)
+
 			// Clear connection immediately to prevent SendMessage from using broken conn
 			c.writeMu.Lock()
 			if c.conn != nil {
 				c.conn.Close()
 				c.conn = nil
 			}
-			c.cipher = nil
 			c.writeMu.Unlock()
 
 			if !c.reconnect() {
 				return
 			}
 			continue
-		}
-
-		// Decrypt if cipher is configured
-		if c.cipher != nil {
-			data, err = c.cipher.Decrypt(data)
-			if err != nil {
-				logger.Error("decrypt message error", "error", err)
-				continue
-			}
 		}
 
 		msg, err := DecodeMessage(bytes.NewReader(data))

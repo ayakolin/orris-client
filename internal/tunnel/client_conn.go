@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -56,10 +55,13 @@ func (c *Client) connectWithRetry() error {
 			"max_retries", c.initialRetryMax,
 			"interval", interval.Round(time.Millisecond))
 
+		// Use timer instead of time.After to avoid goroutine leak
+		timer := time.NewTimer(interval)
 		select {
 		case <-c.ctx.Done():
+			timer.Stop()
 			return c.ctx.Err()
-		case <-time.After(interval):
+		case <-timer.C:
 		}
 
 		err = c.connect()
@@ -148,24 +150,14 @@ func (c *Client) connect() error {
 
 	logger.Info("tunnel handshake successful", "entry_agent_id", result.EntryAgentID)
 
-	// Perform key exchange if shared secret is configured
-	var cipher Cipher
-	if c.sharedSecret != "" {
-		var err error
-		cipher, err = c.performKeyExchange(conn)
-		if err != nil {
-			conn.Close()
-			return fmt.Errorf("key exchange: %w", err)
-		}
-		logger.Info("session key established with forward secrecy")
-	}
-
-	// Hold write lock when updating connection and cipher
+	// Hold write lock when updating connection
 	c.writeMu.Lock()
 	oldConn := c.conn
 	c.conn = conn
-	c.cipher = cipher
 	c.writeMu.Unlock()
+
+	// Set connected state to true after successful connection
+	c.connected.Store(true)
 
 	// Close old connection if exists (during reconnect)
 	if oldConn != nil {
@@ -174,58 +166,6 @@ func (c *Client) connect() error {
 
 	logger.Info("connected to exit agent")
 	return nil
-}
-
-// performKeyExchange performs key exchange with server to establish session key.
-func (c *Client) performKeyExchange(conn *websocket.Conn) (Cipher, error) {
-	// Generate client nonce
-	clientNonce, err := GenerateNonce()
-	if err != nil {
-		return nil, fmt.Errorf("generate nonce: %w", err)
-	}
-
-	// Send client nonce
-	keyExMsg := NewKeyExchangeMessage(clientNonce)
-	keyExData, err := keyExMsg.Encode()
-	if err != nil {
-		return nil, fmt.Errorf("encode key exchange: %w", err)
-	}
-	if err := conn.WriteMessage(websocket.BinaryMessage, keyExData); err != nil {
-		return nil, fmt.Errorf("send key exchange: %w", err)
-	}
-
-	// Receive server nonce
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, serverData, err := conn.ReadMessage()
-	if err != nil {
-		return nil, fmt.Errorf("read server key exchange: %w", err)
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	serverMsg, err := DecodeMessage(bytes.NewReader(serverData))
-	if err != nil {
-		return nil, fmt.Errorf("decode server key exchange: %w", err)
-	}
-	if serverMsg.Type != MsgKeyExchange {
-		return nil, fmt.Errorf("unexpected message type: %d", serverMsg.Type)
-	}
-	if len(serverMsg.Payload) != KeyExchangeNonceSize {
-		return nil, fmt.Errorf("invalid server nonce size: %d", len(serverMsg.Payload))
-	}
-
-	// Derive session key
-	sessionKey, err := DeriveSessionKey(c.sharedSecret, clientNonce, serverMsg.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("derive session key: %w", err)
-	}
-
-	// Create cipher
-	cipher, err := NewXChaCha20Cipher(sessionKey)
-	if err != nil {
-		return nil, fmt.Errorf("create cipher: %w", err)
-	}
-
-	return cipher, nil
 }
 
 // reconnect attempts to reconnect with exponential backoff.
@@ -238,10 +178,13 @@ func (c *Client) reconnect() bool {
 			"attempt", attempt,
 			"interval", interval.Round(time.Millisecond))
 
+		// Use timer instead of time.After to avoid goroutine leak
+		timer := time.NewTimer(interval)
 		select {
 		case <-c.ctx.Done():
+			timer.Stop()
 			return false
-		case <-time.After(interval):
+		case <-timer.C:
 		}
 
 		// Try to refresh endpoint after configured number of failed attempts

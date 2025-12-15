@@ -142,12 +142,12 @@ func (f *RelayForwarder) HandleData(connID uint64, data []byte) {
 // Implements tunnel.MessageHandler for tunnel.Server.
 func (f *RelayForwarder) HandleClose(connID uint64) {
 	f.closedMu.Lock()
+	defer f.closedMu.Unlock()
+
 	if f.closed[connID] {
-		f.closedMu.Unlock()
 		return
 	}
 	f.closed[connID] = true
-	f.closedMu.Unlock()
 
 	logger.Debug("relay forward close to next hop", "rule_id", f.rule.ID, "conn_id", connID)
 
@@ -173,12 +173,12 @@ func (f *RelayForwarder) handleOutboundData(connID uint64, data []byte) {
 // handleOutboundClose handles close from outbound (next hop -> relay -> previous hop).
 func (f *RelayForwarder) handleOutboundClose(connID uint64) {
 	f.closedMu.Lock()
+	defer f.closedMu.Unlock()
+
 	if f.closed[connID] {
-		f.closedMu.Unlock()
 		return
 	}
 	f.closed[connID] = true
-	f.closedMu.Unlock()
 
 	logger.Debug("relay forward close to previous hop", "rule_id", f.rule.ID, "conn_id", connID)
 
@@ -189,12 +189,12 @@ func (f *RelayForwarder) handleOutboundClose(connID uint64) {
 
 func (f *RelayForwarder) closeConn(connID uint64) {
 	f.closedMu.Lock()
+	defer f.closedMu.Unlock()
+
 	if f.closed[connID] {
-		f.closedMu.Unlock()
 		return
 	}
 	f.closed[connID] = true
-	f.closedMu.Unlock()
 
 	if f.inbound != nil {
 		f.inbound.SendMessage(tunnel.NewCloseMessage(connID))

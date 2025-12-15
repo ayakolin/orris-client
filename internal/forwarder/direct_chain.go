@@ -299,7 +299,7 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 	f.udpClientsMu.RUnlock()
 
 	if exists {
-		client.lastActive = time.Now()
+		client.lastActiveNano.Store(time.Now().UnixNano())
 		return client
 	}
 
@@ -329,8 +329,8 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 	client = &udpClient{
 		clientAddr: clientAddr,
 		upstream:   upstream,
-		lastActive: time.Now(),
 	}
+	client.lastActiveNano.Store(time.Now().UnixNano())
 
 	f.udpClientsMu.Lock()
 	f.udpClients[key] = client
@@ -377,7 +377,7 @@ func (f *DirectChainForwarder) udpUpstreamReadLoop(client *udpClient) {
 			return
 		}
 
-		client.lastActive = time.Now()
+		client.lastActiveNano.Store(time.Now().UnixNano())
 		f.traffic.AddDownload(int64(n))
 
 		// Send response back to client
@@ -417,7 +417,9 @@ func (f *DirectChainForwarder) cleanupIdleUDPClients(timeout time.Duration) {
 	defer f.udpClientsMu.Unlock()
 
 	for key, client := range f.udpClients {
-		if now.Sub(client.lastActive) > timeout {
+		lastActiveNano := client.lastActiveNano.Load()
+		lastActive := time.Unix(0, lastActiveNano)
+		if now.Sub(lastActive) > timeout {
 			logger.Debug("direct chain removing idle udp client",
 				"client", client.clientAddr)
 			client.upstream.Close()

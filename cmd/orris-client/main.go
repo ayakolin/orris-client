@@ -24,12 +24,11 @@ var (
 
 func main() {
 	var (
-		serverURL         = flag.StringP("server", "u", "", "server URL")
-		token             = flag.StringP("token", "t", "", "bearer token")
-		wsListenPort      = flag.Uint16P("ws-port", "w", 0, "WebSocket listen port for tunnel (0 = random)")
-		logLevel          = flag.StringP("loglevel", "l", "info", "log level (debug, info, warn, error)")
-		showVersion       = flag.BoolP("version", "v", false, "show version and exit")
-		disableEncryption = flag.Bool("no-encryption", false, "disable tunnel encryption (for testing)")
+		serverURL    = flag.StringP("server", "u", "", "server URL")
+		token        = flag.StringP("token", "t", "", "bearer token")
+		wsListenPort = flag.Uint16P("ws-port", "w", 0, "WebSocket listen port for tunnel (0 = random)")
+		logLevel     = flag.StringP("loglevel", "l", "info", "log level (debug, info, warn, error)")
+		showVersion  = flag.BoolP("version", "v", false, "show version and exit")
 	)
 	flag.Parse()
 
@@ -61,16 +60,13 @@ func main() {
 	if *wsListenPort != 0 {
 		cfg.WsListenPort = *wsListenPort
 	}
-	if *disableEncryption {
-		cfg.DisableEncryption = true
-	}
 
 	if cfg.Token == "" {
 		logger.Error("token is required (use --token or ORRIS_TOKEN env)")
 		os.Exit(1)
 	}
 
-	logger.Info("starting orris-client", "version", version, "server", cfg.ServerURL, "encryption", !cfg.DisableEncryption)
+	logger.Info("starting orris-client", "version", version, "server", cfg.ServerURL)
 
 	ag := agent.New(cfg)
 

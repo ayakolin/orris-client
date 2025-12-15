@@ -47,9 +47,8 @@ func (a *Agent) syncRules() error {
 	rules := resp.Rules
 	logger.Info("rules synced successfully", "count", len(rules))
 
-	// Save signing secret, client token, and rules for handshake verification
+	// Save client token and rules for handshake verification
 	a.rulesMu.Lock()
-	a.signingSecret = resp.TokenSigningSecret
 	if resp.ClientToken != "" {
 		a.clientToken = resp.ClientToken
 		logger.Debug("clientToken synced from API", "token_prefix", tokenPrefix(resp.ClientToken))
@@ -132,6 +131,10 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			ef := forwarder.NewEntryForwarder(rule, t)
 			t.SetHandler(ef)
 			if err := ef.Start(a.ctx); err != nil {
+				// Cleanup: stop tunnel on forwarder start failure
+				if stopErr := t.Stop(); stopErr != nil {
+					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+				}
 				return err
 			}
 			f = ef
@@ -145,6 +148,8 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			ef := forwarder.NewExitForwarder(rule)
 			a.tunnelServer.AddHandler(rule.ID, ef)
 			if err := ef.Start(a.ctx); err != nil {
+				// Cleanup: remove handler on forwarder start failure
+				a.tunnelServer.RemoveHandler(rule.ID)
 				return err
 			}
 			f = ef
@@ -166,6 +171,10 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			ef := forwarder.NewEntryForwarder(rule, t)
 			t.SetHandler(ef)
 			if err := ef.Start(a.ctx); err != nil {
+				// Cleanup: stop tunnel on forwarder start failure
+				if stopErr := t.Stop(); stopErr != nil {
+					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+				}
 				return err
 			}
 			f = ef
@@ -185,6 +194,11 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			rf := forwarder.NewRelayForwarder(rule, t)
 			a.tunnelServer.AddHandler(rule.ID, rf)
 			if err := rf.Start(a.ctx); err != nil {
+				// Cleanup: stop tunnel and remove handler on forwarder start failure
+				if stopErr := t.Stop(); stopErr != nil {
+					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+				}
+				a.tunnelServer.RemoveHandler(rule.ID)
 				return err
 			}
 			f = rf
@@ -198,6 +212,8 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			ef := forwarder.NewExitForwarder(rule)
 			a.tunnelServer.AddHandler(rule.ID, ef)
 			if err := ef.Start(a.ctx); err != nil {
+				// Cleanup: remove handler on forwarder start failure
+				a.tunnelServer.RemoveHandler(rule.ID)
 				return err
 			}
 			f = ef
@@ -229,39 +245,52 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 }
 
 // stopForwarder stops and removes a forwarder by rule ID.
+// Acquires locks in order: forwardersMu -> tunnelsMu
 func (a *Agent) stopForwarder(ruleID string) {
+	// Acquire both locks in correct order to prevent deadlock
 	a.forwardersMu.Lock()
+	a.tunnelsMu.Lock()
+
+	// Stop forwarder if exists
 	if f, exists := a.forwarders[ruleID]; exists {
 		logger.Info("stopping forwarder", "rule_id", ruleID)
 		f.Stop()
 		delete(a.forwarders, ruleID)
 	}
-	a.forwardersMu.Unlock()
 
-	// Also stop tunnel if exists
-	a.tunnelsMu.Lock()
+	// Stop tunnel if exists
 	if t, exists := a.tunnels[ruleID]; exists {
 		t.Stop()
 		delete(a.tunnels, ruleID)
 	}
+
 	a.tunnelsMu.Unlock()
+	a.forwardersMu.Unlock()
 }
 
+// stopAll stops all forwarders and tunnels.
+// Acquires locks in order: forwardersMu -> tunnelsMu
 func (a *Agent) stopAll() {
+	// Acquire both locks in correct order to prevent deadlock
 	a.forwardersMu.Lock()
+	a.tunnelsMu.Lock()
+
+	// Stop all forwarders
 	for _, f := range a.forwarders {
 		f.Stop()
 	}
 	a.forwarders = make(map[string]forwarder.Forwarder)
-	a.forwardersMu.Unlock()
 
-	a.tunnelsMu.Lock()
+	// Stop all tunnels
 	for _, t := range a.tunnels {
 		t.Stop()
 	}
 	a.tunnels = make(map[string]*tunnel.Client)
-	a.tunnelsMu.Unlock()
 
+	a.tunnelsMu.Unlock()
+	a.forwardersMu.Unlock()
+
+	// Stop tunnel server (no lock needed)
 	if a.tunnelServer != nil {
 		a.tunnelServer.Stop()
 		a.tunnelServer = nil

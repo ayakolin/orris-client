@@ -243,7 +243,7 @@ func (t *TrafficCounter) GetAndReset() (upload, download int64) {
 
 // udpClient tracks UDP client state for bidirectional forwarding.
 type udpClient struct {
-	clientAddr *net.UDPAddr
-	upstream   *net.UDPConn
-	lastActive time.Time
+	clientAddr     *net.UDPAddr
+	upstream       *net.UDPConn
+	lastActiveNano atomic.Int64 // Unix nanoseconds, safe for concurrent access
 }

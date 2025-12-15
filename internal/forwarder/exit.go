@@ -201,8 +201,9 @@ func (f *ExitForwarder) HandleData(connID uint64, data []byte) {
 
 	if err := cs.Write(data); err != nil {
 		if errors.Is(err, ErrQueueFull) {
-			// Queue full - target is accepting too slow, log but don't close immediately
-			logger.Warn("exit write queue full, dropping data", "conn_id", connID, "len", len(data))
+			// Queue full - target is accepting too slow, close connection to prevent resource leak
+			logger.Error("exit write queue full, closing connection", "conn_id", connID, "len", len(data))
+			f.closeTCPConn(connID)
 		} else {
 			logger.Debug("exit async write to tcp target failed", "conn_id", connID, "error", err)
 			f.closeTCPConn(connID)

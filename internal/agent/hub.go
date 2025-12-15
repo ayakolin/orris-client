@@ -127,19 +127,33 @@ func (a *Agent) handleHubEvent(conn *forward.HubConn, event *forward.HubEvent) {
 func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSyncData) {
 	logger.Info("received config sync",
 		"version", data.Version,
+		"current_version", a.configVersion,
 		"full_sync", data.FullSync,
 		"added", len(data.Added),
 		"updated", len(data.Updated),
 		"removed", len(data.Removed))
 
-	// Skip if we already have this version or newer
-	if data.Version <= a.configVersion && !data.FullSync {
-		logger.Debug("skipping config sync, already at version", "current", a.configVersion, "received", data.Version)
-		conn.SendConfigAck(&forward.ConfigAckData{
-			Version: data.Version,
-			Success: true,
-		})
-		return
+	// Version check logic:
+	// - For FullSync: always accept (server-initiated forced sync)
+	// - For incremental sync: only accept if received version is strictly greater than current version
+	// - This prevents out-of-order updates (e.g., receiving v103 after v105)
+	if !data.FullSync {
+		if data.Version <= a.configVersion {
+			logger.Warn("skipping outdated config sync",
+				"current_version", a.configVersion,
+				"received_version", data.Version,
+				"reason", "received version not newer than current")
+			conn.SendConfigAck(&forward.ConfigAckData{
+				Version: data.Version,
+				Success: true,
+			})
+			return
+		}
+	} else {
+		// FullSync can override any version (forced synchronization from server)
+		logger.Info("accepting full sync regardless of version",
+			"current_version", a.configVersion,
+			"received_version", data.Version)
 	}
 
 	var syncErr error
@@ -158,10 +172,16 @@ func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSync
 	}
 	if syncErr != nil {
 		ack.Error = syncErr.Error()
-		logger.Error("config sync failed", "error", syncErr)
+		logger.Error("config sync failed",
+			"version", data.Version,
+			"error", syncErr)
 	} else {
+		oldVersion := a.configVersion
 		a.configVersion = data.Version
-		logger.Info("config sync completed", "version", data.Version)
+		logger.Info("config sync completed",
+			"old_version", oldVersion,
+			"new_version", data.Version,
+			"full_sync", data.FullSync)
 	}
 
 	conn.SendConfigAck(ack)
@@ -169,25 +189,30 @@ func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSync
 
 // handleFullSync handles full configuration sync.
 func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
-	// Update token info from full sync (ensures agent always has correct token)
-	a.rulesMu.Lock()
-	if data.ClientToken != "" {
-		a.clientToken = data.ClientToken
-	}
-	if data.TokenSigningSecret != "" {
-		a.signingSecret = data.TokenSigningSecret
-	}
-	a.rulesMu.Unlock()
-
-	// Build rule map from added rules
+	// Build rule map from added rules (no lock needed for local variable)
 	newRules := make(map[string]*forward.Rule)
 	for i := range data.Added {
 		rule := ruleSyncDataToRule(&data.Added[i])
 		newRules[rule.ID] = rule
 	}
 
-	// Stop forwarders not in new rules
+	// Acquire locks in order: rulesMu -> forwardersMu
+	// This prevents deadlock by ensuring consistent lock ordering
+	a.rulesMu.Lock()
 	a.forwardersMu.Lock()
+
+	// Update token info from full sync (ensures agent always has correct token)
+	if data.ClientToken != "" {
+		a.clientToken = data.ClientToken
+	}
+
+	// Update rules list for tunnel server
+	a.rules = make([]forward.Rule, 0, len(newRules))
+	for _, rule := range newRules {
+		a.rules = append(a.rules, *rule)
+	}
+
+	// Stop forwarders not in new rules
 	for ruleID, f := range a.forwarders {
 		if _, exists := newRules[ruleID]; !exists {
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
@@ -195,20 +220,18 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 			delete(a.forwarders, ruleID)
 		}
 	}
-	a.forwardersMu.Unlock()
 
-	// Update rules list for tunnel server
-	a.rulesMu.Lock()
-	a.rules = make([]forward.Rule, 0, len(newRules))
-	for _, rule := range newRules {
-		a.rules = append(a.rules, *rule)
-	}
+	// Copy rules for tunnel server update (to avoid holding lock during update)
+	rulesCopy := make([]forward.Rule, len(a.rules))
+	copy(rulesCopy, a.rules)
+
+	// Release locks before tunnel server update and starting forwarders
+	a.forwardersMu.Unlock()
 	a.rulesMu.Unlock()
 
+	// Update tunnel server with copied rules (no lock held)
 	if a.tunnelServer != nil {
-		a.rulesMu.RLock()
-		a.tunnelServer.UpdateRules(a.rules)
-		a.rulesMu.RUnlock()
+		a.tunnelServer.UpdateRules(rulesCopy)
 	}
 
 	// Start forwarders for new rules

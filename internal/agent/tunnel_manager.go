@@ -67,14 +67,11 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 		return newURL, a.getHandshakeToken(), nil
 	}
 
-	// Build client options with shared secret for forward-secure encryption
+	// Build client options
 	opts := []tunnel.ClientOption{
 		tunnel.WithHeartbeatInterval(30 * time.Second),
 		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
 		tunnel.WithInitialRetry(6),                 // retry up to 6 times for initial connection
-	}
-	if a.signingSecret != "" && !a.cfg.DisableEncryption {
-		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
 	}
 
 	// Use agent's own token for handshake authentication (prefer API-provided token)
@@ -140,14 +137,11 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 		return newURL, newToken, nil
 	}
 
-	// Build client options with shared secret for forward-secure encryption
+	// Build client options
 	opts := []tunnel.ClientOption{
 		tunnel.WithHeartbeatInterval(30 * time.Second),
 		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
 		tunnel.WithInitialRetry(6),                 // retry up to 6 times for initial connection
-	}
-	if a.signingSecret != "" && !a.cfg.DisableEncryption {
-		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
 	}
 
 	t := tunnel.NewClient(wsURL, token, rule.ID, opts...)
@@ -181,9 +175,8 @@ func (a *Agent) ensureTunnelServer() error {
 		return nil
 	}
 
-	// signingSecret is always needed for token verification
-	// DisableEncryption only affects key exchange, not authentication
-	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.signingSecret, a.cfg.DisableEncryption, a.rules)
+	// Pass forward.Client for server-side handshake verification
+	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.client.ForwardClient(), a.rules)
 	if err := a.tunnelServer.Start(a.ctx); err != nil {
 		return fmt.Errorf("start tunnel server: %w", err)
 	}

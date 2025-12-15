@@ -7,14 +7,13 @@ import (
 )
 
 type Config struct {
-	ServerURL         string
-	Token             string
-	WsListenPort      uint16 // WebSocket listen port for tunnel connections (exit agent)
-	SyncInterval      time.Duration
-	TrafficInterval   time.Duration
-	StatusInterval    time.Duration
-	HTTPTimeout       time.Duration
-	DisableEncryption bool // Disable tunnel encryption (for testing)
+	ServerURL       string
+	Token           string
+	WsListenPort    uint16 // WebSocket listen port for tunnel connections (exit agent)
+	SyncInterval    time.Duration
+	TrafficInterval time.Duration
+	StatusInterval  time.Duration
+	HTTPTimeout     time.Duration
 }
 
 func DefaultConfig() *Config {
