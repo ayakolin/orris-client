@@ -134,8 +134,13 @@ build-linux-universal: build-linux build-linux-arm64
 	@echo "Build complete: bin/${BINARY_NAME}-linux (universal wrapper)"
 
 # Build all Linux targets with UPX
+.PHONY: build-linux-all-upx
+build-linux-all-upx: build-linux-upx build-linux-arm64-upx
+	@echo "All Linux UPX builds complete"
+
+# Alias for build-linux-all-upx
 .PHONY: release-linux
-release-linux: build-linux-upx build-linux-arm64-upx
+release-linux: build-linux-all-upx
 	@echo "All Linux release builds complete"
 
 # Install (simple copy to /usr/local/bin)
@@ -168,7 +173,8 @@ help:
 	@echo "  make build-linux-arm64  - Build for Linux arm64"
 	@echo "  make build-linux-upx    - Build Linux amd64 with UPX"
 	@echo "  make build-linux-arm64-upx - Build Linux arm64 with UPX"
-	@echo "  make release-linux      - Build all Linux releases with UPX"
+	@echo "  make build-linux-all-upx - Build both Linux amd64 and arm64 with UPX"
+	@echo "  make release-linux      - Build all Linux releases with UPX (alias)"
 	@echo "  make clean              - Clean build artifacts"
 	@echo "  make run                - Build and run (needs ORRIS_TOKEN)"
 	@echo "  make test               - Run tests"

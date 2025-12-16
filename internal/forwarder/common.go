@@ -115,15 +115,36 @@ type Forwarder interface {
 }
 
 // writeQueueSize is the buffer size for async write queue.
-// Large enough to absorb bursts without blocking the tunnel read loop.
-// 2048 entries should handle most speed test scenarios.
-const writeQueueSize = 2048
+// Large enough to absorb bursts while providing backpressure.
+// Increased from 2048 to 4096 to handle slow client scenarios.
+const writeQueueSize = 4096
 
 // maxBatchSize is the maximum number of buffers to batch in a single writev call.
-const maxBatchSize = 64
+// Increased from 64 to 128 to better handle small packet scenarios (e.g., Shadowsocks).
+const maxBatchSize = 128
+
+// writeTimeout is the maximum time to wait for queue space when full.
+// This provides backpressure to upstream without immediately failing.
+const writeTimeout = 5 * time.Second
 
 // ErrQueueFull is returned when the write queue is full.
 var ErrQueueFull = errors.New("write queue full")
+
+// pooledBuffer holds buffer data for async write queue.
+// Buffers are obtained from writeBufferPool and returned after write.
+type pooledBuffer struct {
+	data []byte
+}
+
+// writeBufferPool is a pool for async write buffers.
+// This reduces memory allocations in the async write queue path.
+var writeBufferPool = sync.Pool{
+	New: func() any {
+		return &pooledBuffer{
+			data: make([]byte, 0, bufferSize),
+		}
+	},
+}
 
 // connState manages async write queue for a connection.
 // It completely decouples the tunnel read loop from connection writes.
@@ -131,7 +152,7 @@ var ErrQueueFull = errors.New("write queue full")
 // and an independent goroutine processes the queue.
 type connState struct {
 	conn      net.Conn
-	queue     chan []byte
+	queue     chan *pooledBuffer
 	closed    atomic.Bool
 	closeOnce sync.Once
 	trafficFn func(int64)
@@ -141,7 +162,7 @@ type connState struct {
 func newConnState(conn net.Conn, trafficFn func(int64)) *connState {
 	cs := &connState{
 		conn:      conn,
-		queue:     make(chan []byte, writeQueueSize),
+		queue:     make(chan *pooledBuffer, writeQueueSize),
 		trafficFn: trafficFn,
 	}
 	go cs.writeLoop()
@@ -151,26 +172,30 @@ func newConnState(conn net.Conn, trafficFn func(int64)) *connState {
 // writeLoop processes the write queue with batch optimization.
 // It uses writev (via net.Buffers) to combine multiple small writes
 // into a single system call for better performance.
+// Buffers are returned to the pool after successful write.
 func (cs *connState) writeLoop() {
 	bufs := make(net.Buffers, 0, maxBatchSize)
+	pbs := make([]*pooledBuffer, 0, maxBatchSize)
 
 	for {
 		// Wait for first data
-		data, ok := <-cs.queue
+		pb, ok := <-cs.queue
 		if !ok {
 			return
 		}
-		bufs = append(bufs, data)
+		bufs = append(bufs, pb.data)
+		pbs = append(pbs, pb)
 
 		// Non-blocking batch: collect more data if available
 	drain:
 		for len(bufs) < maxBatchSize {
 			select {
-			case data, ok := <-cs.queue:
+			case pb, ok := <-cs.queue:
 				if !ok {
 					break drain
 				}
-				bufs = append(bufs, data)
+				bufs = append(bufs, pb.data)
+				pbs = append(pbs, pb)
 			default:
 				break drain
 			}
@@ -181,6 +206,12 @@ func (cs *connState) writeLoop() {
 		if cs.trafficFn != nil && n > 0 {
 			cs.trafficFn(n)
 		}
+
+		// Return all buffers to pool after write
+		for _, pb := range pbs {
+			writeBufferPool.Put(pb)
+		}
+
 		if err != nil {
 			cs.closed.Store(true)
 			return
@@ -188,34 +219,48 @@ func (cs *connState) writeLoop() {
 
 		// Reset for next batch
 		bufs = bufs[:0]
+		pbs = pbs[:0]
 	}
 }
 
-// Write queues data for async write. Non-blocking to prevent head-of-line blocking.
-// With a large queue (2048), this should handle most burst scenarios.
+// Write queues data for async write with timeout-based backpressure.
+// When queue is full, it waits up to writeTimeout before failing.
+// This prevents immediate connection closure during slow client scenarios.
+// Uses pooled buffers to reduce memory allocations.
 func (cs *connState) Write(data []byte) error {
 	if cs.closed.Load() {
 		return net.ErrClosed
 	}
 
-	// Copy data since the original buffer may be reused
-	buf := make([]byte, len(data))
-	copy(buf, data)
+	// Get buffer from pool
+	pb := writeBufferPool.Get().(*pooledBuffer)
+	if cap(pb.data) < len(data) {
+		pb.data = make([]byte, len(data))
+	}
+	pb.data = pb.data[:len(data)]
+	copy(pb.data, data)
 
-	// Non-blocking send - never block the tunnel read loop
+	// Blocking send with timeout - provides backpressure
 	select {
-	case cs.queue <- buf:
+	case cs.queue <- pb:
 		return nil
-	default:
+	case <-time.After(writeTimeout):
+		// Timeout waiting for queue space
+		writeBufferPool.Put(pb)
 		return ErrQueueFull
 	}
 }
 
 // Close closes the connection and write queue.
+// Drains remaining buffers and returns them to the pool.
 func (cs *connState) Close() {
 	cs.closeOnce.Do(func() {
 		cs.closed.Store(true)
 		close(cs.queue)
+		// Drain remaining buffers and return to pool
+		for pb := range cs.queue {
+			writeBufferPool.Put(pb)
+		}
 		cs.conn.Close()
 	})
 }
