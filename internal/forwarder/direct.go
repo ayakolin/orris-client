@@ -193,9 +193,10 @@ func (f *DirectForwarder) handleTCPConn(clientConn net.Conn) {
 	wg.Add(2)
 
 	// Client -> Target (upload)
+	// Use copyWithTraffic for zero-copy via splice(2) on Linux
 	go func() {
 		defer wg.Done()
-		copyBuffer(f.ctx, targetConn, clientConn, f.traffic.AddUpload)
+		copyWithTraffic(f.ctx, targetConn, clientConn, f.traffic.AddUpload)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -204,7 +205,7 @@ func (f *DirectForwarder) handleTCPConn(clientConn net.Conn) {
 	// Target -> Client (download)
 	go func() {
 		defer wg.Done()
-		copyBuffer(f.ctx, clientConn, targetConn, f.traffic.AddDownload)
+		copyWithTraffic(f.ctx, clientConn, targetConn, f.traffic.AddDownload)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

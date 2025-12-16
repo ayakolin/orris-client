@@ -8,7 +8,6 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v4 v4.25.11
-	golang.org/x/crypto v0.46.0
 )
 
 require (

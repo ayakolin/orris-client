@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/orris-inc/orris-client/internal/logger"
 )
 
 // isClosedError checks if the error is due to closed connection.
@@ -41,11 +43,58 @@ func (tw *trafficWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
-// copyWithTraffic copies data from src to dst using io.Copy.
-// On Linux, this leverages splice(2) for zero-copy when both src and dst are sockets,
+// ReadFrom implements io.ReaderFrom to enable zero-copy optimization.
+// When both src and dst are TCP sockets, Go's runtime uses splice(2) on Linux
+// to transfer data directly in kernel space without copying to userspace.
+// This provides significant performance improvements for high-throughput scenarios.
+func (tw *trafficWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	// Delegate to underlying writer's ReadFrom if available (e.g., *net.TCPConn)
+	if rf, ok := tw.w.(io.ReaderFrom); ok {
+		n, err = rf.ReadFrom(r)
+		if n > 0 && tw.trafficFn != nil {
+			tw.trafficFn(n)
+		}
+		return
+	}
+
+	// Fallback: underlying writer doesn't support ReadFrom
+	// This happens for non-TCP connections (e.g., TLS, pipes, files)
+	return io.Copy(tw.w, r)
+}
+
+// isZeroCopySupported checks if zero-copy is supported for the given connection.
+// Zero-copy via splice(2) requires both connections to be TCP sockets.
+// Returns true if both dst and src are *net.TCPConn, false otherwise.
+func isZeroCopySupported(dst io.Writer, src io.Reader) bool {
+	_, dstIsTCP := dst.(*net.TCPConn)
+	_, srcIsTCP := src.(*net.TCPConn)
+	return dstIsTCP && srcIsTCP
+}
+
+// copyWithTraffic copies data from src to dst using io.Copy with context support.
+// On Linux, this leverages splice(2) for zero-copy when both src and dst are TCP sockets,
 // which provides better backpressure propagation in multi-hop forwarding chains.
-func copyWithTraffic(dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
+// The trafficWriter's ReadFrom implementation enables this optimization automatically.
+//
+// Context cancellation is handled by relying on connection closure from the caller.
+// When ctx is cancelled, the caller should close the connections, which will cause
+// io.Copy to return with an error. This approach maintains zero-copy performance
+// while still supporting graceful shutdown.
+func copyWithTraffic(ctx context.Context, dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
+	// Check context before starting
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+
 	tw := &trafficWriter{w: dst, trafficFn: trafficFn}
+
+	// Log when zero-copy is expected (debug mode only)
+	if isZeroCopySupported(dst, src) {
+		logger.Debug("zero-copy enabled for TCP socket transfer")
+	}
+
 	return io.Copy(tw, src)
 }
 
@@ -55,48 +104,6 @@ var bufPool = sync.Pool{
 		buf := make([]byte, bufferSize)
 		return &buf
 	},
-}
-
-// copyBuffer copies data from src to dst using a pooled buffer.
-// It calls trafficFn with the number of bytes written after each write.
-// It respects context cancellation by checking ctx.Done() between reads.
-// NOTE: For multi-hop forwarding chains, consider using copyWithTraffic instead
-// for better backpressure propagation via splice(2).
-func copyBuffer(ctx context.Context, dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
-	bufp := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bufp)
-
-	var written int64
-	for {
-		select {
-		case <-ctx.Done():
-			return written, ctx.Err()
-		default:
-		}
-
-		nr, rerr := src.Read(*bufp)
-		if nr > 0 {
-			nw, werr := dst.Write((*bufp)[:nr])
-			if nw > 0 {
-				written += int64(nw)
-				if trafficFn != nil {
-					trafficFn(int64(nw))
-				}
-			}
-			if werr != nil {
-				return written, werr
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				return written, nil
-			}
-			return written, rerr
-		}
-	}
 }
 
 // Forwarder is an interface for all forwarder types.
