@@ -302,9 +302,9 @@ type udpClient struct {
 
 // Circuit breaker constants
 const (
-	cbFailureThreshold = 5                // Failures to trigger open state
+	cbFailureThreshold = 4                // Failures to trigger open state (like ping)
 	cbResetTimeout     = 30 * time.Second // Time before attempting recovery
-	cbHalfOpenMax      = 3                // Max concurrent requests in half-open state
+	cbHalfOpenMax      = 1                // Single request to test recovery
 )
 
 // circuitState represents the circuit breaker state.
