@@ -317,11 +317,10 @@ type udpClient struct {
 // Circuit breaker constants
 const (
 	cbFailureThreshold = 3  // Failures to trigger exponential backoff
-	cbBlockedThreshold = 10 // Failures to mark target as blocked
+	cbBlockedThreshold = 10 // Failures to mark target as blocked (uses max backoff)
 	cbHalfOpenMax      = 1  // Single request to test recovery
 	cbMinBackoff       = 100 * time.Millisecond
 	cbMaxBackoff       = 30 * time.Second
-	cbBlockedDuration  = 10 * time.Minute // Duration to block unreachable targets
 )
 
 // circuitState represents the circuit breaker state.
@@ -383,14 +382,13 @@ func (cb *circuitBreaker) Allow() bool {
 		return cb.allowHalfOpen()
 
 	case cbStateBlocked:
-		// Check if blocked period has passed
+		// Blocked state uses max backoff for periodic probe
 		lastFailure := cb.lastFailureTime.Load()
-		if time.Since(time.Unix(0, lastFailure)) >= cbBlockedDuration {
+		if time.Since(time.Unix(0, lastFailure)) >= cbMaxBackoff {
 			// Transition to half-open to test recovery
 			if cb.state.CompareAndSwap(int32(cbStateBlocked), int32(cbStateHalfOpen)) {
 				cb.halfOpenCount.Store(0)
-				cb.backoffNanos.Store(int64(cbMinBackoff)) // Reset backoff
-				logger.Info("circuit breaker unblocked, transitioning to half-open state")
+				logger.Info("circuit breaker blocked, probing for recovery")
 			}
 			return cb.allowHalfOpen()
 		}
@@ -438,10 +436,12 @@ func (cb *circuitBreaker) RecordFailure() {
 
 	// Check if we should enter blocked state (too many failures)
 	if failures >= cbBlockedThreshold {
+		if state == cbStateHalfOpen {
+			cb.halfOpenCount.Add(-1)
+		}
 		if cb.state.CompareAndSwap(int32(state), int32(cbStateBlocked)) {
 			logger.Warn("circuit breaker blocked target as unreachable",
-				"failures", failures,
-				"blocked_duration", cbBlockedDuration)
+				"failures", failures)
 		}
 		return
 	}
@@ -491,12 +491,12 @@ func (cb *circuitBreaker) BackoffDuration() time.Duration {
 	lastFailure := cb.lastFailureTime.Load()
 	elapsed := time.Since(time.Unix(0, lastFailure))
 
-	// For blocked state, use blocked duration
+	// For blocked state, use max backoff for periodic probe
 	if state == cbStateBlocked {
-		if elapsed >= cbBlockedDuration {
+		if elapsed >= cbMaxBackoff {
 			return 0
 		}
-		return cbBlockedDuration - elapsed
+		return cbMaxBackoff - elapsed
 	}
 
 	// For open state, use exponential backoff
