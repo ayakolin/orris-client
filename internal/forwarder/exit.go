@@ -61,6 +61,12 @@ func (f *ExitForwarder) SetSender(s tunnel.Sender) {
 // Start starts the exit forwarder.
 func (f *ExitForwarder) Start(ctx context.Context) error {
 	f.ctx, f.cancel = context.WithCancel(ctx)
+
+	// Validate target address
+	if f.rule.TargetAddress == "" {
+		return fmt.Errorf("target address is empty")
+	}
+
 	logger.Info("exit forwarder started",
 		"rule_id", f.rule.ID,
 		"target", fmt.Sprintf("%s:%d", f.rule.TargetAddress, f.rule.TargetPort))

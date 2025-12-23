@@ -62,10 +62,24 @@ func (f *DirectChainForwarder) Start(ctx context.Context) error {
 	var nextHop string
 	if f.rule.IsLastInChain {
 		// Exit node: connect to final target
+		if f.rule.TargetAddress == "" {
+			return fmt.Errorf("target address is empty for exit node")
+		}
 		nextHop = net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
 	} else {
 		// Entry or Relay: connect to next hop
+		if f.rule.NextHopAddress == "" {
+			return fmt.Errorf("next hop address is empty for non-exit node")
+		}
 		nextHop = net.JoinHostPort(f.rule.NextHopAddress, fmt.Sprintf("%d", f.rule.NextHopPort))
+	}
+
+	// Prevent self-connection loop that would cause FD exhaustion
+	if f.rule.ListenPort == f.rule.NextHopPort && !f.rule.IsLastInChain {
+		if isLocalAddress(f.rule.NextHopAddress) {
+			return fmt.Errorf("next hop would connect to self (listen=%d, next_hop=%s:%d)",
+				f.rule.ListenPort, f.rule.NextHopAddress, f.rule.NextHopPort)
+		}
 	}
 
 	protocol := f.rule.Protocol

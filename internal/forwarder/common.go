@@ -18,6 +18,19 @@ func isClosedError(err error) bool {
 	return errors.Is(err, net.ErrClosed)
 }
 
+// isLocalAddress checks if the address resolves to a local address.
+// This is used to prevent self-connection loops.
+func isLocalAddress(addr string) bool {
+	if addr == "" || addr == "localhost" || addr == "127.0.0.1" || addr == "::1" {
+		return true
+	}
+	// Check if it starts with 127.
+	if strings.HasPrefix(addr, "127.") {
+		return true
+	}
+	return false
+}
+
 // bufferSize is the size of the buffer used for copying data.
 // Using 64KB to match WebSocket buffer size for better throughput.
 const bufferSize = 64 * 1024
@@ -303,12 +316,12 @@ type udpClient struct {
 
 // Circuit breaker constants
 const (
-	cbFailureThreshold  = 3  // Failures to trigger exponential backoff
-	cbBlockedThreshold  = 10 // Failures to mark target as blocked
-	cbHalfOpenMax       = 1  // Single request to test recovery
-	cbMinBackoff        = 100 * time.Millisecond
-	cbMaxBackoff        = 30 * time.Second
-	cbBlockedDuration   = 10 * time.Minute // Duration to block unreachable targets
+	cbFailureThreshold = 3  // Failures to trigger exponential backoff
+	cbBlockedThreshold = 10 // Failures to mark target as blocked
+	cbHalfOpenMax      = 1  // Single request to test recovery
+	cbMinBackoff       = 100 * time.Millisecond
+	cbMaxBackoff       = 30 * time.Second
+	cbBlockedDuration  = 10 * time.Minute // Duration to block unreachable targets
 )
 
 // circuitState represents the circuit breaker state.

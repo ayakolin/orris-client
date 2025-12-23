@@ -45,6 +45,17 @@ func NewDirectForwarder(rule *forward.Rule) *DirectForwarder {
 func (f *DirectForwarder) Start(ctx context.Context) error {
 	f.ctx, f.cancel = context.WithCancel(ctx)
 
+	// Validate target address
+	if f.rule.TargetAddress == "" {
+		return fmt.Errorf("target address is empty")
+	}
+
+	// Prevent self-connection loop that would cause FD exhaustion
+	if f.rule.ListenPort == f.rule.TargetPort && isLocalAddress(f.rule.TargetAddress) {
+		return fmt.Errorf("target would connect to self (listen=%d, target=%s:%d)",
+			f.rule.ListenPort, f.rule.TargetAddress, f.rule.TargetPort)
+	}
+
 	protocol := f.rule.Protocol
 	if protocol == "" {
 		protocol = "tcp"
