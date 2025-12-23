@@ -369,9 +369,11 @@ func (f *EntryForwarder) udpReadLoop() {
 }
 
 // getOrCreateUDPConnID gets or creates a connID for a UDP client.
+// Uses double-check locking to prevent race conditions.
 func (f *EntryForwarder) getOrCreateUDPConnID(clientAddr *net.UDPAddr) uint64 {
 	key := clientAddr.String()
 
+	// Fast path: check with read lock
 	f.udpClientsMu.RLock()
 	connID, exists := f.udpClients[key]
 	f.udpClientsMu.RUnlock()
@@ -380,10 +382,17 @@ func (f *EntryForwarder) getOrCreateUDPConnID(clientAddr *net.UDPAddr) uint64 {
 		return connID
 	}
 
-	// Create new connID
-	connID = f.nextConnID.Add(1)
-
+	// Slow path: create with write lock
 	f.udpClientsMu.Lock()
+
+	// Double-check: another goroutine may have created it
+	if connID, exists = f.udpClients[key]; exists {
+		f.udpClientsMu.Unlock()
+		return connID
+	}
+
+	// Create new connID while holding the lock
+	connID = f.nextConnID.Add(1)
 	f.udpClients[key] = connID
 	f.udpConnIDs[connID] = clientAddr
 	f.udpClientsMu.Unlock()

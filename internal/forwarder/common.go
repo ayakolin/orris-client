@@ -73,7 +73,12 @@ func (tw *trafficWriter) ReadFrom(r io.Reader) (n int64, err error) {
 
 	// Fallback: underlying writer doesn't support ReadFrom
 	// This happens for non-TCP connections (e.g., TLS, pipes, files)
-	return io.Copy(tw.w, r)
+	// Use io.CopyBuffer with trafficWriter.Write to ensure traffic is counted
+	// Use pooled buffer to reduce GC pressure
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	n, err = io.CopyBuffer(tw, r, *bufPtr)
+	return
 }
 
 // isZeroCopySupported checks if zero-copy is supported for the given connection.

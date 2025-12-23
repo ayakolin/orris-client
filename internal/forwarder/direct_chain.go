@@ -314,9 +314,11 @@ func (f *DirectChainForwarder) udpReadLoop(nextHop string) {
 }
 
 // getOrCreateUDPClient gets or creates a UDP client connection.
+// Uses double-check locking to prevent race conditions.
 func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nextHop string) *udpClient {
 	key := clientAddr.String()
 
+	// Fast path: check with read lock
 	f.udpClientsMu.RLock()
 	client, exists := f.udpClients[key]
 	f.udpClientsMu.RUnlock()
@@ -334,9 +336,20 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 		return nil
 	}
 
+	// Slow path: create with write lock
+	f.udpClientsMu.Lock()
+
+	// Double-check: another goroutine may have created it
+	if client, exists = f.udpClients[key]; exists {
+		f.udpClientsMu.Unlock()
+		client.lastActiveNano.Store(time.Now().UnixNano())
+		return client
+	}
+
 	// Create new upstream connection with optional bind IP
 	upstreamAddr, err := net.ResolveUDPAddr("udp", nextHop)
 	if err != nil {
+		f.udpClientsMu.Unlock()
 		logger.Error("direct chain resolve upstream addr failed",
 			"next_hop", nextHop,
 			"error", err)
@@ -350,6 +363,7 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 
 	upstream, err := net.DialUDP("udp", localAddr, upstreamAddr)
 	if err != nil {
+		f.udpClientsMu.Unlock()
 		f.cb.RecordFailure()
 		logger.Error("direct chain udp dial upstream failed",
 			"next_hop", nextHop,
@@ -368,7 +382,6 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 	}
 	client.lastActiveNano.Store(time.Now().UnixNano())
 
-	f.udpClientsMu.Lock()
 	f.udpClients[key] = client
 	f.udpClientsMu.Unlock()
 

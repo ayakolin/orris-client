@@ -4,11 +4,23 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
 	"github.com/orris-inc/orris-client/internal/tunnel"
 )
+
+// Constants for closed connections cleanup.
+const (
+	closedEntryTTL      = 5 * time.Minute // TTL for closed connection entries
+	closedCleanupPeriod = 1 * time.Minute // Cleanup check interval
+)
+
+// closedEntry tracks when a connection was closed for cleanup purposes.
+type closedEntry struct {
+	closedAt int64 // Unix nano timestamp
+}
 
 // RelayForwarder handles relay forwarding (WS tunnel inbound -> WS tunnel outbound).
 // It bridges data between two tunnel connections in a chain.
@@ -20,7 +32,7 @@ type RelayForwarder struct {
 	outbound *tunnel.Client // client to next hop
 
 	closedMu sync.RWMutex
-	closed   map[uint64]bool // track closed connections to avoid loops
+	closed   map[uint64]*closedEntry // track closed connections to avoid loops
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -33,7 +45,7 @@ func NewRelayForwarder(rule *forward.Rule, outbound *tunnel.Client) *RelayForwar
 		rule:     rule,
 		outbound: outbound,
 		traffic:  &TrafficCounter{},
-		closed:   make(map[uint64]bool),
+		closed:   make(map[uint64]*closedEntry),
 	}
 }
 
@@ -48,6 +60,10 @@ func (f *RelayForwarder) Start(ctx context.Context) error {
 
 	// Set outbound handler wrapper for responses from next hop
 	f.outbound.SetHandler(&relayOutboundHandler{relay: f})
+
+	// Start cleanup loop for closed connections map
+	f.wg.Add(1)
+	go f.closedCleanupLoop()
 
 	logger.Info("relay forwarder started",
 		"rule_id", f.rule.ID,
@@ -144,10 +160,10 @@ func (f *RelayForwarder) HandleClose(connID uint64) {
 	f.closedMu.Lock()
 	defer f.closedMu.Unlock()
 
-	if f.closed[connID] {
+	if f.closed[connID] != nil {
 		return
 	}
-	f.closed[connID] = true
+	f.closed[connID] = &closedEntry{closedAt: time.Now().UnixNano()}
 
 	logger.Debug("relay forward close to next hop", "rule_id", f.rule.ID, "conn_id", connID)
 
@@ -175,10 +191,10 @@ func (f *RelayForwarder) handleOutboundClose(connID uint64) {
 	f.closedMu.Lock()
 	defer f.closedMu.Unlock()
 
-	if f.closed[connID] {
+	if f.closed[connID] != nil {
 		return
 	}
-	f.closed[connID] = true
+	f.closed[connID] = &closedEntry{closedAt: time.Now().UnixNano()}
 
 	logger.Debug("relay forward close to previous hop", "rule_id", f.rule.ID, "conn_id", connID)
 
@@ -191,16 +207,48 @@ func (f *RelayForwarder) closeConn(connID uint64) {
 	f.closedMu.Lock()
 	defer f.closedMu.Unlock()
 
-	if f.closed[connID] {
+	if f.closed[connID] != nil {
 		return
 	}
-	f.closed[connID] = true
+	f.closed[connID] = &closedEntry{closedAt: time.Now().UnixNano()}
 
 	if f.inbound != nil {
 		f.inbound.SendMessage(tunnel.NewCloseMessage(connID))
 	}
 	if f.outbound != nil {
 		f.outbound.SendMessage(tunnel.NewCloseMessage(connID))
+	}
+}
+
+// closedCleanupLoop periodically removes expired entries from the closed map.
+func (f *RelayForwarder) closedCleanupLoop() {
+	defer f.wg.Done()
+
+	ticker := time.NewTicker(closedCleanupPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-ticker.C:
+			f.cleanupClosedEntries()
+		}
+	}
+}
+
+// cleanupClosedEntries removes entries older than closedEntryTTL from the closed map.
+func (f *RelayForwarder) cleanupClosedEntries() {
+	now := time.Now().UnixNano()
+	ttlNanos := int64(closedEntryTTL)
+
+	f.closedMu.Lock()
+	defer f.closedMu.Unlock()
+
+	for connID, entry := range f.closed {
+		if now-entry.closedAt > ttlNanos {
+			delete(f.closed, connID)
+		}
 	}
 }
 

@@ -170,16 +170,29 @@ func (a *Agent) updateRuleCache(rule *forward.Rule) {
 
 // ensureTunnelServer ensures the tunnel server is started.
 // If WsListenPort is 0, a random available port will be used.
+// Uses double-check locking to prevent race conditions.
 func (a *Agent) ensureTunnelServer() error {
+	// Fast path: check without lock
+	if a.tunnelServer != nil {
+		return nil
+	}
+
+	// Slow path: acquire lock and double-check
+	a.tunnelServerMu.Lock()
+	defer a.tunnelServerMu.Unlock()
+
+	// Double-check: another goroutine may have created it
 	if a.tunnelServer != nil {
 		return nil
 	}
 
 	// Pass forward.Client for server-side handshake verification
-	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.client.ForwardClient(), a.rules)
-	if err := a.tunnelServer.Start(a.ctx); err != nil {
+	server := tunnel.NewServer(a.cfg.WsListenPort, a.client.ForwardClient(), a.rules)
+	if err := server.Start(a.ctx); err != nil {
 		return fmt.Errorf("start tunnel server: %w", err)
 	}
+
+	a.tunnelServer = server
 
 	// Update config with actual port (important when port was 0)
 	a.cfg.WsListenPort = a.tunnelServer.Port()

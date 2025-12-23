@@ -44,8 +44,9 @@ type Agent struct {
 	tunnelsMu sync.RWMutex
 	tunnels   map[string]*tunnel.Client // ruleID -> tunnel
 
-	tunnelServer  *tunnel.Server
-	configVersion uint64 // current config version from server
+	tunnelServerMu sync.Mutex // protects tunnelServer initialization
+	tunnelServer   *tunnel.Server
+	configVersion  uint64 // current config version from server
 
 	ctx      context.Context
 	cancelFn context.CancelFunc

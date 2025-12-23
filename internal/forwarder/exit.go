@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
@@ -16,9 +17,9 @@ import (
 
 // udpExitClient tracks UDP client state on exit side.
 type udpExitClient struct {
-	clientAddr string       // Entry-side client address (for logging)
-	upstream   *net.UDPConn // Connection to target
-	lastActive time.Time
+	clientAddr     string       // Entry-side client address (for logging)
+	upstream       *net.UDPConn // Connection to target
+	lastActiveNano atomic.Int64 // Unix nanoseconds, safe for concurrent access
 }
 
 // ExitForwarder handles exit forwarding (WS tunnel -> target).
@@ -66,6 +67,10 @@ func (f *ExitForwarder) Start(ctx context.Context) error {
 	if f.rule.TargetAddress == "" {
 		return fmt.Errorf("target address is empty")
 	}
+
+	// Start UDP cleanup loop
+	f.wg.Add(1)
+	go f.udpCleanupLoop()
 
 	logger.Info("exit forwarder started",
 		"rule_id", f.rule.ID,
@@ -219,8 +224,8 @@ func (f *ExitForwarder) HandleConnectWithPayload(connID uint64, payload []byte) 
 	client := &udpExitClient{
 		clientAddr: clientAddr,
 		upstream:   upstream,
-		lastActive: time.Now(),
 	}
+	client.lastActiveNano.Store(time.Now().UnixNano())
 
 	f.udpConnsMu.Lock()
 	f.udpConns[actualID] = client
@@ -274,7 +279,7 @@ func (f *ExitForwarder) handleUDPData(connID uint64, data []byte) {
 		return
 	}
 
-	client.lastActive = time.Now()
+	client.lastActiveNano.Store(time.Now().UnixNano())
 
 	n, err := client.upstream.Write(data)
 	if err != nil {
@@ -355,7 +360,7 @@ func (f *ExitForwarder) udpUpstreamReadLoop(connID uint64, client *udpExitClient
 			return
 		}
 
-		client.lastActive = time.Now()
+		client.lastActiveNano.Store(time.Now().UnixNano())
 		f.traffic.AddDownload(int64(n))
 
 		// Send response back through tunnel
@@ -402,5 +407,42 @@ func (f *ExitForwarder) closeUDPConn(connID uint64) {
 func (f *ExitForwarder) sendUDPClose(connID uint64) {
 	if f.tunnel != nil {
 		f.tunnel.SendMessage(tunnel.NewUDPCloseMessage(connID))
+	}
+}
+
+// udpCleanupLoop periodically cleans up idle UDP connections.
+func (f *ExitForwarder) udpCleanupLoop() {
+	defer f.wg.Done()
+
+	ticker := time.NewTicker(udpCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-ticker.C:
+			f.cleanupIdleUDPClients()
+		}
+	}
+}
+
+// cleanupIdleUDPClients removes idle UDP clients.
+func (f *ExitForwarder) cleanupIdleUDPClients() {
+	now := time.Now()
+
+	f.udpConnsMu.Lock()
+	defer f.udpConnsMu.Unlock()
+
+	for connID, client := range f.udpConns {
+		lastActiveNano := client.lastActiveNano.Load()
+		lastActive := time.Unix(0, lastActiveNano)
+		if now.Sub(lastActive) > udpIdleTimeout {
+			logger.Debug("exit removing idle udp client", "conn_id", connID, "client", client.clientAddr)
+			if client.upstream != nil {
+				client.upstream.Close()
+			}
+			delete(f.udpConns, connID)
+		}
 	}
 }
