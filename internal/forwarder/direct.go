@@ -154,25 +154,14 @@ func (f *DirectForwarder) RuleID() string {
 }
 
 func (f *DirectForwarder) tcpAcceptLoop() {
-	defer f.wg.Done()
-
-	for {
-		conn, err := f.tcpListener.Accept()
-		if err != nil {
-			select {
-			case <-f.ctx.Done():
-				return
-			default:
-				if !isClosedError(err) {
-					logger.Error("direct tcp accept error", "error", err)
-				}
-				continue
-			}
-		}
-
-		f.wg.Add(1)
-		go f.handleTCPConn(conn)
-	}
+	runAcceptLoop(acceptLoopConfig{
+		ctx:      f.ctx,
+		listener: f.tcpListener,
+		cb:       f.cb,
+		wg:       &f.wg,
+		logName:  "direct",
+		handler:  f.handleTCPConn,
+	})
 }
 
 func (f *DirectForwarder) handleTCPConn(clientConn net.Conn) {

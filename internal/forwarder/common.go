@@ -432,3 +432,52 @@ func (cb *circuitBreaker) State() string {
 		return "unknown"
 	}
 }
+
+// acceptLoopConfig configures the TCP accept loop behavior.
+type acceptLoopConfig struct {
+	ctx      context.Context
+	listener net.Listener
+	cb       *circuitBreaker
+	wg       *sync.WaitGroup
+	logName  string              // e.g., "direct", "direct chain", "entry"
+	handler  func(conn net.Conn) // connection handler, must call wg.Done()
+}
+
+// runAcceptLoop runs the TCP accept loop with circuit breaker protection.
+// It checks the circuit breaker before accepting connections to prevent FD exhaustion.
+// When the circuit breaker is open, it delays accept attempts to reduce resource usage.
+func runAcceptLoop(cfg acceptLoopConfig) {
+	defer cfg.wg.Done()
+
+	for {
+		// Check circuit breaker BEFORE accept to prevent FD exhaustion
+		// When CB is open, we delay accept to avoid resource exhaustion
+		if cfg.cb.IsOpen() {
+			select {
+			case <-cfg.ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				// Brief delay when circuit is open to reduce accept rate
+				continue
+			}
+		}
+
+		conn, err := cfg.listener.Accept()
+		if err != nil {
+			select {
+			case <-cfg.ctx.Done():
+				return
+			default:
+				if !isClosedError(err) {
+					logger.Error(cfg.logName+" tcp accept error", "error", err)
+					// If accept fails due to resource exhaustion, add delay
+					time.Sleep(10 * time.Millisecond)
+				}
+				continue
+			}
+		}
+
+		cfg.wg.Add(1)
+		go cfg.handler(conn)
+	}
+}

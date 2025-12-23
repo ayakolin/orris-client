@@ -181,25 +181,16 @@ func (f *DirectChainForwarder) RuleID() string {
 
 // tcpAcceptLoop accepts TCP connections and handles them.
 func (f *DirectChainForwarder) tcpAcceptLoop(nextHop string) {
-	defer f.wg.Done()
-
-	for {
-		conn, err := f.tcpListener.Accept()
-		if err != nil {
-			select {
-			case <-f.ctx.Done():
-				return
-			default:
-				if !isClosedError(err) {
-					logger.Error("direct chain tcp accept error", "error", err)
-				}
-				continue
-			}
-		}
-
-		f.wg.Add(1)
-		go f.handleTCPConn(conn, nextHop)
-	}
+	runAcceptLoop(acceptLoopConfig{
+		ctx:      f.ctx,
+		listener: f.tcpListener,
+		cb:       f.cb,
+		wg:       &f.wg,
+		logName:  "direct chain",
+		handler: func(conn net.Conn) {
+			f.handleTCPConn(conn, nextHop)
+		},
+	})
 }
 
 // handleTCPConn handles a single TCP connection.

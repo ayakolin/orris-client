@@ -25,6 +25,9 @@ type EntryForwarder struct {
 	connMu sync.RWMutex
 	conns  map[uint64]*connState // connID -> TCP client connection state (async write)
 
+	// Circuit breaker to prevent connection storms when tunnel is unavailable
+	cb *circuitBreaker
+
 	// UDP client tracking: clientAddr -> connID mapping
 	udpClientsMu sync.RWMutex
 	udpClients   map[string]uint64       // clientAddr -> connID
@@ -42,6 +45,7 @@ func NewEntryForwarder(rule *forward.Rule, t tunnel.Sender) *EntryForwarder {
 		rule:       rule,
 		tunnel:     t,
 		traffic:    &TrafficCounter{},
+		cb:         newCircuitBreaker(),
 		conns:      make(map[uint64]*connState),
 		udpClients: make(map[string]uint64),
 		udpConnIDs: make(map[uint64]*net.UDPAddr),
@@ -246,29 +250,27 @@ func (f *EntryForwarder) HandleClose(connID uint64) {
 }
 
 func (f *EntryForwarder) tcpAcceptLoop() {
-	defer f.wg.Done()
-
-	for {
-		conn, err := f.tcpListener.Accept()
-		if err != nil {
-			select {
-			case <-f.ctx.Done():
-				return
-			default:
-				if !isClosedError(err) {
-					logger.Error("entry tcp accept error", "error", err)
-				}
-				continue
-			}
-		}
-
-		f.wg.Add(1)
-		go f.handleTCPConn(conn)
-	}
+	runAcceptLoop(acceptLoopConfig{
+		ctx:      f.ctx,
+		listener: f.tcpListener,
+		cb:       f.cb,
+		wg:       &f.wg,
+		logName:  "entry",
+		handler:  f.handleTCPConn,
+	})
 }
 
 func (f *EntryForwarder) handleTCPConn(clientConn net.Conn) {
 	defer f.wg.Done()
+	defer clientConn.Close()
+
+	// Check circuit breaker before processing
+	if !f.cb.Allow() {
+		logger.Debug("entry connection rejected by circuit breaker",
+			"rule_id", f.rule.ID,
+			"state", f.cb.State())
+		return
+	}
 
 	connID := f.nextConnID.Add(1)
 
@@ -284,9 +286,11 @@ func (f *EntryForwarder) handleTCPConn(clientConn net.Conn) {
 	logger.Debug("entry new tcp connection", "conn_id", connID, "client", clientConn.RemoteAddr())
 
 	if err := f.tunnel.SendMessage(tunnel.NewConnectMessage(connID)); err != nil {
+		f.cb.RecordFailure()
 		logger.Error("entry send connect message failed", "conn_id", connID, "error", err)
 		return
 	}
+	f.cb.RecordSuccess()
 
 	bufp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufp)
@@ -310,6 +314,7 @@ func (f *EntryForwarder) handleTCPConn(clientConn net.Conn) {
 		f.traffic.AddUpload(int64(n))
 
 		if err := f.tunnel.SendMessage(tunnel.NewDataMessage(connID, buf[:n])); err != nil {
+			f.cb.RecordFailure()
 			logger.Error("entry send data message failed", "conn_id", connID, "error", err)
 			return
 		}
