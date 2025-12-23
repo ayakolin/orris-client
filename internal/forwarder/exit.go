@@ -30,6 +30,9 @@ type ExitForwarder struct {
 	connMu sync.RWMutex
 	conns  map[uint64]*connState // connID -> TCP target connection state (async write)
 
+	// Circuit breaker to prevent connection storms when target is unreachable
+	cb *circuitBreaker
+
 	// UDP connections
 	udpConnsMu sync.RWMutex
 	udpConns   map[uint64]*udpExitClient // connID -> UDP state
@@ -44,6 +47,7 @@ func NewExitForwarder(rule *forward.Rule) *ExitForwarder {
 	return &ExitForwarder{
 		rule:     rule,
 		traffic:  &TrafficCounter{},
+		cb:       newCircuitBreaker(),
 		conns:    make(map[uint64]*connState),
 		udpConns: make(map[uint64]*udpExitClient),
 	}
@@ -106,6 +110,18 @@ func (f *ExitForwarder) RuleID() string {
 func (f *ExitForwarder) HandleConnect(connID uint64) {
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
 
+	// Check circuit breaker before attempting dial
+	if !f.cb.Allow() {
+		logger.Debug("exit connection rejected by circuit breaker",
+			"conn_id", connID,
+			"target", targetAddr,
+			"state", f.cb.State())
+		if f.tunnel != nil {
+			f.tunnel.SendMessage(tunnel.NewCloseMessage(connID))
+		}
+		return
+	}
+
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	if f.rule.BindIP != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
@@ -113,12 +129,21 @@ func (f *ExitForwarder) HandleConnect(connID uint64) {
 
 	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		logger.Error("exit tcp dial target failed", "conn_id", connID, "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
+		f.cb.RecordFailure()
+		logger.Error("exit tcp dial target failed",
+			"conn_id", connID,
+			"target", targetAddr,
+			"bind_ip", f.rule.BindIP,
+			"cb_state", f.cb.State(),
+			"error", err)
 		if f.tunnel != nil {
 			f.tunnel.SendMessage(tunnel.NewCloseMessage(connID))
 		}
 		return
 	}
+
+	// Dial succeeded, record success
+	f.cb.RecordSuccess()
 
 	// Create connState with async write queue for upload direction
 	cs := newConnState(targetConn, f.traffic.AddUpload)
@@ -146,6 +171,17 @@ func (f *ExitForwarder) HandleConnectWithPayload(connID uint64, payload []byte) 
 	clientAddr := string(payload)
 
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
+
+	// Check circuit breaker before attempting dial
+	if !f.cb.Allow() {
+		logger.Debug("exit udp connection rejected by circuit breaker",
+			"conn_id", actualID,
+			"target", targetAddr,
+			"state", f.cb.State())
+		f.sendUDPClose(actualID)
+		return
+	}
+
 	upstreamAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
 		logger.Error("exit resolve udp target failed", "conn_id", actualID, "error", err)
@@ -160,10 +196,19 @@ func (f *ExitForwarder) HandleConnectWithPayload(connID uint64, payload []byte) 
 
 	upstream, err := net.DialUDP("udp", localAddr, upstreamAddr)
 	if err != nil {
-		logger.Error("exit udp dial target failed", "conn_id", actualID, "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
+		f.cb.RecordFailure()
+		logger.Error("exit udp dial target failed",
+			"conn_id", actualID,
+			"target", targetAddr,
+			"bind_ip", f.rule.BindIP,
+			"cb_state", f.cb.State(),
+			"error", err)
 		f.sendUDPClose(actualID)
 		return
 	}
+
+	// Dial succeeded, record success
+	f.cb.RecordSuccess()
 
 	client := &udpExitClient{
 		clientAddr: clientAddr,

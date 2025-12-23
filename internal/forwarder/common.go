@@ -299,3 +299,136 @@ type udpClient struct {
 	upstream       *net.UDPConn
 	lastActiveNano atomic.Int64 // Unix nanoseconds, safe for concurrent access
 }
+
+// Circuit breaker constants
+const (
+	cbFailureThreshold = 5                // Failures to trigger open state
+	cbResetTimeout     = 30 * time.Second // Time before attempting recovery
+	cbHalfOpenMax      = 3                // Max concurrent requests in half-open state
+)
+
+// circuitState represents the circuit breaker state.
+type circuitState int32
+
+const (
+	cbStateClosed   circuitState = iota // Normal operation
+	cbStateOpen                         // Rejecting all requests
+	cbStateHalfOpen                     // Testing recovery with limited requests
+)
+
+// ErrCircuitOpen is returned when circuit breaker is open.
+var ErrCircuitOpen = errors.New("circuit breaker is open")
+
+// circuitBreaker implements circuit breaker pattern to prevent connection storms.
+// When downstream is unreachable, it stops attempting new connections to prevent
+// resource exhaustion (file descriptor leak).
+type circuitBreaker struct {
+	state           atomic.Int32 // circuitState
+	failures        atomic.Int32 // Consecutive failure count
+	lastFailureTime atomic.Int64 // Unix nano of last failure
+	halfOpenCount   atomic.Int32 // Current requests in half-open state
+}
+
+// newCircuitBreaker creates a new circuit breaker.
+func newCircuitBreaker() *circuitBreaker {
+	return &circuitBreaker{}
+}
+
+// Allow checks if a request should be allowed.
+// Returns true if allowed, false if circuit is open.
+func (cb *circuitBreaker) Allow() bool {
+	state := circuitState(cb.state.Load())
+
+	switch state {
+	case cbStateClosed:
+		return true
+
+	case cbStateOpen:
+		// Check if enough time has passed to try recovery
+		lastFailure := cb.lastFailureTime.Load()
+		if time.Since(time.Unix(0, lastFailure)) >= cbResetTimeout {
+			// Transition to half-open
+			if cb.state.CompareAndSwap(int32(cbStateOpen), int32(cbStateHalfOpen)) {
+				cb.halfOpenCount.Store(0)
+				logger.Info("circuit breaker transitioning to half-open state")
+			}
+			return cb.allowHalfOpen()
+		}
+		return false
+
+	case cbStateHalfOpen:
+		return cb.allowHalfOpen()
+	}
+
+	return true
+}
+
+// allowHalfOpen checks if request is allowed in half-open state.
+func (cb *circuitBreaker) allowHalfOpen() bool {
+	count := cb.halfOpenCount.Add(1)
+	if count > cbHalfOpenMax {
+		cb.halfOpenCount.Add(-1)
+		return false
+	}
+	return true
+}
+
+// RecordSuccess records a successful operation.
+func (cb *circuitBreaker) RecordSuccess() {
+	state := circuitState(cb.state.Load())
+
+	if state == cbStateHalfOpen {
+		cb.halfOpenCount.Add(-1)
+		// Successful in half-open, close the circuit
+		if cb.state.CompareAndSwap(int32(cbStateHalfOpen), int32(cbStateClosed)) {
+			cb.failures.Store(0)
+			logger.Info("circuit breaker closed after successful recovery")
+		}
+	} else if state == cbStateClosed {
+		// Reset failure count on success
+		cb.failures.Store(0)
+	}
+}
+
+// RecordFailure records a failed operation.
+func (cb *circuitBreaker) RecordFailure() {
+	cb.lastFailureTime.Store(time.Now().UnixNano())
+	state := circuitState(cb.state.Load())
+
+	if state == cbStateHalfOpen {
+		cb.halfOpenCount.Add(-1)
+		// Failed in half-open, reopen the circuit
+		if cb.state.CompareAndSwap(int32(cbStateHalfOpen), int32(cbStateOpen)) {
+			logger.Warn("circuit breaker reopened after failed recovery attempt")
+		}
+		return
+	}
+
+	failures := cb.failures.Add(1)
+	if failures >= cbFailureThreshold && state == cbStateClosed {
+		if cb.state.CompareAndSwap(int32(cbStateClosed), int32(cbStateOpen)) {
+			logger.Warn("circuit breaker opened after consecutive failures",
+				"failures", failures,
+				"threshold", cbFailureThreshold)
+		}
+	}
+}
+
+// IsOpen returns true if the circuit is open.
+func (cb *circuitBreaker) IsOpen() bool {
+	return circuitState(cb.state.Load()) == cbStateOpen
+}
+
+// State returns the current state as a string for logging.
+func (cb *circuitBreaker) State() string {
+	switch circuitState(cb.state.Load()) {
+	case cbStateClosed:
+		return "closed"
+	case cbStateOpen:
+		return "open"
+	case cbStateHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}

@@ -22,6 +22,9 @@ type DirectChainForwarder struct {
 	tcpListener net.Listener
 	udpConn     *net.UDPConn
 
+	// Circuit breaker to prevent connection storms when downstream is unreachable
+	cb *circuitBreaker
+
 	// UDP client tracking for response routing
 	udpClientsMu sync.RWMutex
 	udpClients   map[string]*udpClient // client addr -> upstream conn
@@ -36,6 +39,7 @@ func NewDirectChainForwarder(rule *forward.Rule) *DirectChainForwarder {
 	return &DirectChainForwarder{
 		rule:       rule,
 		traffic:    &TrafficCounter{},
+		cb:         newCircuitBreaker(),
 		udpClients: make(map[string]*udpClient),
 	}
 }
@@ -203,6 +207,15 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	defer f.wg.Done()
 	defer clientConn.Close()
 
+	// Check circuit breaker before attempting dial
+	if !f.cb.Allow() {
+		logger.Debug("direct chain connection rejected by circuit breaker",
+			"rule_id", f.rule.ID,
+			"next_hop", nextHop,
+			"state", f.cb.State())
+		return
+	}
+
 	// Connect to next hop with optional bind IP
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	if f.rule.BindIP != "" {
@@ -211,13 +224,18 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 
 	upstreamConn, err := dialer.Dial("tcp", nextHop)
 	if err != nil {
+		f.cb.RecordFailure()
 		logger.Error("direct chain tcp dial failed",
 			"rule_id", f.rule.ID,
 			"next_hop", nextHop,
 			"bind_ip", f.rule.BindIP,
+			"cb_state", f.cb.State(),
 			"error", err)
 		return
 	}
+
+	// Dial succeeded, record success
+	f.cb.RecordSuccess()
 	defer upstreamConn.Close()
 
 	logger.Debug("direct chain tcp connection established",
@@ -303,6 +321,14 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 		return client
 	}
 
+	// Check circuit breaker before creating new connection
+	if !f.cb.Allow() {
+		logger.Debug("direct chain udp connection rejected by circuit breaker",
+			"next_hop", nextHop,
+			"state", f.cb.State())
+		return nil
+	}
+
 	// Create new upstream connection with optional bind IP
 	upstreamAddr, err := net.ResolveUDPAddr("udp", nextHop)
 	if err != nil {
@@ -319,12 +345,17 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 
 	upstream, err := net.DialUDP("udp", localAddr, upstreamAddr)
 	if err != nil {
+		f.cb.RecordFailure()
 		logger.Error("direct chain udp dial upstream failed",
 			"next_hop", nextHop,
 			"bind_ip", f.rule.BindIP,
+			"cb_state", f.cb.State(),
 			"error", err)
 		return nil
 	}
+
+	// Dial succeeded, record success
+	f.cb.RecordSuccess()
 
 	client = &udpClient{
 		clientAddr: clientAddr,
