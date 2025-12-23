@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -444,20 +445,25 @@ type acceptLoopConfig struct {
 }
 
 // runAcceptLoop runs the TCP accept loop with circuit breaker protection.
-// It checks the circuit breaker before accepting connections to prevent FD exhaustion.
-// When the circuit breaker is open, it delays accept attempts to reduce resource usage.
+// When circuit breaker is open, it completely stops accepting new connections
+// until the circuit breaker recovers (aggressive rejection strategy).
+// This prevents FD exhaustion when downstream is unreachable.
 func runAcceptLoop(cfg acceptLoopConfig) {
 	defer cfg.wg.Done()
 
+	var lastErrLogTime time.Time
+	var errCount int64
+
 	for {
-		// Check circuit breaker BEFORE accept to prevent FD exhaustion
-		// When CB is open, we delay accept to avoid resource exhaustion
+		// Aggressive rejection: completely stop accepting when CB is open
+		// Wait for CB reset timeout before attempting any new accepts
 		if cfg.cb.IsOpen() {
 			select {
 			case <-cfg.ctx.Done():
 				return
-			case <-time.After(100 * time.Millisecond):
-				// Brief delay when circuit is open to reduce accept rate
+			case <-time.After(cbResetTimeout):
+				// Wait full reset timeout before checking again
+				// This gives downstream time to recover
 				continue
 			}
 		}
@@ -469,9 +475,28 @@ func runAcceptLoop(cfg acceptLoopConfig) {
 				return
 			default:
 				if !isClosedError(err) {
-					logger.Error(cfg.logName+" tcp accept error", "error", err)
-					// If accept fails due to resource exhaustion, add delay
-					time.Sleep(10 * time.Millisecond)
+					errCount++
+					// Rate limit error logs: log at most once per second
+					if time.Since(lastErrLogTime) >= time.Second {
+						logger.Error(cfg.logName+" tcp accept error",
+							"error", err,
+							"count_since_last_log", errCount)
+						lastErrLogTime = time.Now()
+						errCount = 0
+					}
+
+					// Detect EMFILE/ENFILE errors and apply longer backoff
+					// This gives existing connections time to close and release FDs
+					if isResourceExhaustedError(err) {
+						select {
+						case <-cfg.ctx.Done():
+							return
+						case <-time.After(2 * time.Second):
+							// Long backoff for FD exhaustion
+						}
+					} else {
+						time.Sleep(10 * time.Millisecond)
+					}
 				}
 				continue
 			}
@@ -480,4 +505,14 @@ func runAcceptLoop(cfg acceptLoopConfig) {
 		cfg.wg.Add(1)
 		go cfg.handler(conn)
 	}
+}
+
+// isResourceExhaustedError checks if the error is due to resource exhaustion (EMFILE/ENFILE).
+func isResourceExhaustedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "too many open files") ||
+		strings.Contains(errStr, "no file descriptors available")
 }
