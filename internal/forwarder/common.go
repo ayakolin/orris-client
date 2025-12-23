@@ -303,9 +303,12 @@ type udpClient struct {
 
 // Circuit breaker constants
 const (
-	cbFailureThreshold = 4                // Failures to trigger open state (like ping)
-	cbResetTimeout     = 30 * time.Second // Time before attempting recovery
-	cbHalfOpenMax      = 1                // Single request to test recovery
+	cbFailureThreshold  = 3  // Failures to trigger exponential backoff
+	cbBlockedThreshold  = 10 // Failures to mark target as blocked
+	cbHalfOpenMax       = 1  // Single request to test recovery
+	cbMinBackoff        = 100 * time.Millisecond
+	cbMaxBackoff        = 30 * time.Second
+	cbBlockedDuration   = 10 * time.Minute // Duration to block unreachable targets
 )
 
 // circuitState represents the circuit breaker state.
@@ -313,30 +316,34 @@ type circuitState int32
 
 const (
 	cbStateClosed   circuitState = iota // Normal operation
-	cbStateOpen                         // Rejecting all requests
+	cbStateOpen                         // Rejecting requests with exponential backoff
 	cbStateHalfOpen                     // Testing recovery with limited requests
+	cbStateBlocked                      // Target marked as unreachable, reject for extended period
 )
 
 // ErrCircuitOpen is returned when circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
-// circuitBreaker implements circuit breaker pattern to prevent connection storms.
-// When downstream is unreachable, it stops attempting new connections to prevent
-// resource exhaustion (file descriptor leak).
+// circuitBreaker implements circuit breaker pattern with exponential backoff.
+// When downstream is unreachable, it uses exponential backoff to reduce
+// connection attempts and prevent resource exhaustion.
 type circuitBreaker struct {
 	state           atomic.Int32 // circuitState
 	failures        atomic.Int32 // Consecutive failure count
 	lastFailureTime atomic.Int64 // Unix nano of last failure
 	halfOpenCount   atomic.Int32 // Current requests in half-open state
+	backoffNanos    atomic.Int64 // Current backoff duration in nanoseconds
 }
 
 // newCircuitBreaker creates a new circuit breaker.
 func newCircuitBreaker() *circuitBreaker {
-	return &circuitBreaker{}
+	cb := &circuitBreaker{}
+	cb.backoffNanos.Store(int64(cbMinBackoff))
+	return cb
 }
 
 // Allow checks if a request should be allowed.
-// Returns true if allowed, false if circuit is open.
+// Returns true if allowed, false if circuit is open or blocked.
 func (cb *circuitBreaker) Allow() bool {
 	state := circuitState(cb.state.Load())
 
@@ -345,13 +352,15 @@ func (cb *circuitBreaker) Allow() bool {
 		return true
 
 	case cbStateOpen:
-		// Check if enough time has passed to try recovery
+		// Check if backoff period has passed
 		lastFailure := cb.lastFailureTime.Load()
-		if time.Since(time.Unix(0, lastFailure)) >= cbResetTimeout {
+		backoff := time.Duration(cb.backoffNanos.Load())
+		if time.Since(time.Unix(0, lastFailure)) >= backoff {
 			// Transition to half-open
 			if cb.state.CompareAndSwap(int32(cbStateOpen), int32(cbStateHalfOpen)) {
 				cb.halfOpenCount.Store(0)
-				logger.Info("circuit breaker transitioning to half-open state")
+				logger.Info("circuit breaker transitioning to half-open state",
+					"backoff", backoff)
 			}
 			return cb.allowHalfOpen()
 		}
@@ -359,6 +368,20 @@ func (cb *circuitBreaker) Allow() bool {
 
 	case cbStateHalfOpen:
 		return cb.allowHalfOpen()
+
+	case cbStateBlocked:
+		// Check if blocked period has passed
+		lastFailure := cb.lastFailureTime.Load()
+		if time.Since(time.Unix(0, lastFailure)) >= cbBlockedDuration {
+			// Transition to half-open to test recovery
+			if cb.state.CompareAndSwap(int32(cbStateBlocked), int32(cbStateHalfOpen)) {
+				cb.halfOpenCount.Store(0)
+				cb.backoffNanos.Store(int64(cbMinBackoff)) // Reset backoff
+				logger.Info("circuit breaker unblocked, transitioning to half-open state")
+			}
+			return cb.allowHalfOpen()
+		}
+		return false
 	}
 
 	return true
@@ -374,50 +397,107 @@ func (cb *circuitBreaker) allowHalfOpen() bool {
 	return true
 }
 
-// RecordSuccess records a successful operation.
+// RecordSuccess records a successful operation and resets backoff.
 func (cb *circuitBreaker) RecordSuccess() {
 	state := circuitState(cb.state.Load())
 
 	if state == cbStateHalfOpen {
 		cb.halfOpenCount.Add(-1)
-		// Successful in half-open, close the circuit
+		// Successful in half-open, close the circuit and reset backoff
 		if cb.state.CompareAndSwap(int32(cbStateHalfOpen), int32(cbStateClosed)) {
 			cb.failures.Store(0)
+			cb.backoffNanos.Store(int64(cbMinBackoff))
 			logger.Info("circuit breaker closed after successful recovery")
 		}
 	} else if state == cbStateClosed {
-		// Reset failure count on success
+		// Reset failure count and backoff on success
 		cb.failures.Store(0)
+		cb.backoffNanos.Store(int64(cbMinBackoff))
 	}
 }
 
-// RecordFailure records a failed operation.
+// RecordFailure records a failed operation and increases backoff.
+// After cbBlockedThreshold failures, the target is marked as blocked for cbBlockedDuration.
 func (cb *circuitBreaker) RecordFailure() {
 	cb.lastFailureTime.Store(time.Now().UnixNano())
 	state := circuitState(cb.state.Load())
+	failures := cb.failures.Add(1)
 
-	if state == cbStateHalfOpen {
-		cb.halfOpenCount.Add(-1)
-		// Failed in half-open, reopen the circuit
-		if cb.state.CompareAndSwap(int32(cbStateHalfOpen), int32(cbStateOpen)) {
-			logger.Warn("circuit breaker reopened after failed recovery attempt")
+	// Check if we should enter blocked state (too many failures)
+	if failures >= cbBlockedThreshold {
+		if cb.state.CompareAndSwap(int32(state), int32(cbStateBlocked)) {
+			logger.Warn("circuit breaker blocked target as unreachable",
+				"failures", failures,
+				"blocked_duration", cbBlockedDuration)
 		}
 		return
 	}
 
-	failures := cb.failures.Add(1)
+	if state == cbStateHalfOpen {
+		cb.halfOpenCount.Add(-1)
+		// Failed in half-open, reopen and double backoff
+		if cb.state.CompareAndSwap(int32(cbStateHalfOpen), int32(cbStateOpen)) {
+			cb.doubleBackoff()
+			logger.Warn("circuit breaker reopened after failed recovery attempt",
+				"backoff", time.Duration(cb.backoffNanos.Load()))
+		}
+		return
+	}
+
 	if failures >= cbFailureThreshold && state == cbStateClosed {
 		if cb.state.CompareAndSwap(int32(cbStateClosed), int32(cbStateOpen)) {
-			logger.Warn("circuit breaker opened after consecutive failures",
+			logger.Warn("circuit breaker opened with exponential backoff",
 				"failures", failures,
-				"threshold", cbFailureThreshold)
+				"backoff", time.Duration(cb.backoffNanos.Load()))
 		}
 	}
 }
 
-// IsOpen returns true if the circuit is open.
+// doubleBackoff doubles the current backoff duration up to max.
+func (cb *circuitBreaker) doubleBackoff() {
+	for {
+		current := cb.backoffNanos.Load()
+		newBackoff := current * 2
+		if newBackoff > int64(cbMaxBackoff) {
+			newBackoff = int64(cbMaxBackoff)
+		}
+		if cb.backoffNanos.CompareAndSwap(current, newBackoff) {
+			return
+		}
+	}
+}
+
+// BackoffDuration returns the remaining wait time before next attempt.
+// Returns 0 if circuit is closed or backoff period has passed.
+func (cb *circuitBreaker) BackoffDuration() time.Duration {
+	state := circuitState(cb.state.Load())
+	if state == cbStateClosed {
+		return 0
+	}
+
+	lastFailure := cb.lastFailureTime.Load()
+	elapsed := time.Since(time.Unix(0, lastFailure))
+
+	// For blocked state, use blocked duration
+	if state == cbStateBlocked {
+		if elapsed >= cbBlockedDuration {
+			return 0
+		}
+		return cbBlockedDuration - elapsed
+	}
+
+	// For open state, use exponential backoff
+	backoff := time.Duration(cb.backoffNanos.Load())
+	if elapsed >= backoff {
+		return 0
+	}
+	return backoff - elapsed
+}
+
+// IsOpen returns true if the circuit is open or blocked.
 func (cb *circuitBreaker) IsOpen() bool {
-	return circuitState(cb.state.Load()) == cbStateOpen
+	state := circuitState(cb.state.Load())
+	return state == cbStateOpen || state == cbStateBlocked
 }
 
 // State returns the current state as a string for logging.
@@ -429,6 +509,8 @@ func (cb *circuitBreaker) State() string {
 		return "open"
 	case cbStateHalfOpen:
 		return "half-open"
+	case cbStateBlocked:
+		return "blocked"
 	default:
 		return "unknown"
 	}
@@ -445,8 +527,7 @@ type acceptLoopConfig struct {
 }
 
 // runAcceptLoop runs the TCP accept loop with circuit breaker protection.
-// When circuit breaker is open, it completely stops accepting new connections
-// until the circuit breaker recovers (aggressive rejection strategy).
+// When circuit breaker is open, it uses exponential backoff before accepting.
 // This prevents FD exhaustion when downstream is unreachable.
 func runAcceptLoop(cfg acceptLoopConfig) {
 	defer cfg.wg.Done()
@@ -455,15 +536,12 @@ func runAcceptLoop(cfg acceptLoopConfig) {
 	var errCount int64
 
 	for {
-		// Aggressive rejection: completely stop accepting when CB is open
-		// Wait for CB reset timeout before attempting any new accepts
-		if cfg.cb.IsOpen() {
+		// When CB is open, wait with exponential backoff before accepting
+		if backoff := cfg.cb.BackoffDuration(); backoff > 0 {
 			select {
 			case <-cfg.ctx.Done():
 				return
-			case <-time.After(cbResetTimeout):
-				// Wait full reset timeout before checking again
-				// This gives downstream time to recover
+			case <-time.After(backoff):
 				continue
 			}
 		}

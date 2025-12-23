@@ -122,7 +122,7 @@ func (f *ExitForwarder) HandleConnect(connID uint64) {
 		return
 	}
 
-	dialer := &net.Dialer{Timeout: 1 * time.Second}
+	dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
 	if f.rule.BindIP != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
 	}
