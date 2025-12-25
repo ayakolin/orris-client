@@ -14,12 +14,20 @@ import (
 	"github.com/orris-inc/orris-client/internal/tunnel"
 )
 
+// ruleStatus tracks sync and runtime status of a rule.
+type ruleStatus struct {
+	syncStatus   string // synced, pending, failed
+	runStatus    string // running, stopped, error, starting
+	errorMessage string
+	syncedAt     int64
+}
+
 type Agent struct {
 	cfg       *config.Config
 	client    *api.Client
 	collector *status.Collector
 
-	// Lock ordering to prevent deadlocks: rulesMu -> forwardersMu -> tunnelsMu
+	// Lock ordering to prevent deadlocks: rulesMu -> forwardersMu -> ruleStatusMu -> tunnelsMu
 	// CRITICAL: Always acquire locks in this order when multiple locks are needed.
 	// Never acquire locks in reverse order to avoid circular wait conditions.
 	//
@@ -30,9 +38,8 @@ type Agent struct {
 	// 4. Release locks as soon as possible to reduce contention
 	//
 	// Examples:
-	//   ✓ Correct: rulesMu.Lock() -> forwardersMu.Lock() -> tunnelsMu.Lock()
-	//   ✗ Wrong:   forwardersMu.Lock() -> rulesMu.Lock() (violates ordering)
-	//   ✗ Wrong:   tunnelsMu.Lock() -> forwardersMu.Lock() (violates ordering)
+	//   ✓ Correct: forwardersMu.Lock() -> ruleStatusMu.Lock()
+	//   ✗ Wrong:   ruleStatusMu.Lock() -> forwardersMu.Lock() (violates ordering)
 
 	rulesMu     sync.RWMutex
 	rules       []forward.Rule
@@ -43,6 +50,10 @@ type Agent struct {
 
 	tunnelsMu sync.RWMutex
 	tunnels   map[string]tunnel.TunnelClient // ruleID -> tunnel (WS or TLS)
+
+	// Rule status tracking
+	ruleStatusMu sync.RWMutex
+	ruleStatus   map[string]*ruleStatus // ruleID -> status
 
 	tunnelServerMu    sync.Mutex // protects tunnelServer initialization
 	tunnelServer      *tunnel.Server
@@ -67,6 +78,7 @@ func New(cfg *config.Config) *Agent {
 		collector:  status.NewCollector(),
 		forwarders: make(map[string]forwarder.Forwarder),
 		tunnels:    make(map[string]tunnel.TunnelClient),
+		ruleStatus: make(map[string]*ruleStatus),
 	}
 }
 

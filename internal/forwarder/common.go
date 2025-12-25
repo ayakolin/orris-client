@@ -131,6 +131,8 @@ type Forwarder interface {
 	Stop() error
 	Traffic() *TrafficCounter
 	RuleID() string
+	ListenPort() uint16 // Returns the actual listening port, 0 if not applicable
+	Connections() int   // Returns the current number of active connections
 }
 
 // writeQueueSize is the buffer size for async write queue.

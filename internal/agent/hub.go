@@ -233,10 +233,12 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 	for ruleID, f := range a.forwarders {
 		newRule, exists := newRules[ruleID]
 		if !exists {
-			// Rule removed
+			// Rule removed - stop forwarder and clean up status
+			// Lock order: forwardersMu (held) -> ruleStatusMu (acquired by deleteRuleStatus)
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
 			f.Stop()
 			delete(a.forwarders, ruleID)
+			a.deleteRuleStatus(ruleID)
 		} else if oldRule, hadOld := oldRules[ruleID]; hadOld && ruleConfigChanged(oldRule, newRule) {
 			// Rule exists but config changed - need restart
 			logger.Info("stopping forwarder for changed rule", "rule_id", ruleID)
@@ -254,9 +256,12 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 	a.forwardersMu.Unlock()
 	a.rulesMu.Unlock()
 
-	// Update tunnel server with copied rules (no lock held)
+	// Update tunnel servers with copied rules (no lock held)
 	if a.tunnelServer != nil {
 		a.tunnelServer.UpdateRules(rulesCopy)
+	}
+	if a.tlsTunnelServer != nil {
+		a.tlsTunnelServer.UpdateRules(rulesCopy)
 	}
 
 	// Restart forwarders with changed config
@@ -304,15 +309,17 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 
 // handleIncrementalSync handles incremental configuration sync.
 func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
-	// Handle removed rules
+	// Handle removed rules (updateStatus=false since we delete status immediately after)
 	for _, ruleID := range data.Removed {
-		a.stopForwarder(ruleID)
+		a.stopForwarder(ruleID, false)
+		a.deleteRuleStatus(ruleID)
 	}
 
 	// Handle updated rules (stop then start)
+	// updateStatus=false since startForwarder will set the new status
 	for i := range data.Updated {
 		rule := ruleSyncDataToRule(&data.Updated[i])
-		a.stopForwarder(rule.ID)
+		a.stopForwarder(rule.ID, false)
 		if err := a.startForwarder(rule); err != nil {
 			logger.Error("restart forwarder failed", "rule_id", rule.ID, "error", err)
 		}

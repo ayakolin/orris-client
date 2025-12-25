@@ -274,3 +274,14 @@ func (h *relayOutboundHandler) HandleData(connID uint64, data []byte) {
 func (h *relayOutboundHandler) HandleClose(connID uint64) {
 	h.relay.handleOutboundClose(connID)
 }
+
+// ListenPort returns 0 as RelayForwarder does not have a listening port.
+func (f *RelayForwarder) ListenPort() uint16 {
+	return 0
+}
+
+// Connections returns 0 as RelayForwarder cannot accurately track active connections.
+// Relay mode bridges tunnel connections and does not maintain a connection map.
+func (f *RelayForwarder) Connections() int {
+	return 0
+}

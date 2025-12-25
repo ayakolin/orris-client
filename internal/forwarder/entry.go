@@ -416,3 +416,31 @@ func (f *EntryForwarder) closeUDPConn(connID uint64) {
 		delete(f.udpConnIDs, connID)
 	}
 }
+
+// ListenPort returns the actual listening port from the listener or UDP connection.
+func (f *EntryForwarder) ListenPort() uint16 {
+	if f.tcpListener != nil {
+		if addr, ok := f.tcpListener.Addr().(*net.TCPAddr); ok {
+			return uint16(addr.Port)
+		}
+	}
+	if f.udpConn != nil {
+		if addr, ok := f.udpConn.LocalAddr().(*net.UDPAddr); ok {
+			return uint16(addr.Port)
+		}
+	}
+	return 0
+}
+
+// Connections returns the current number of active connections (TCP + UDP).
+func (f *EntryForwarder) Connections() int {
+	f.connMu.RLock()
+	tcpConns := len(f.conns)
+	f.connMu.RUnlock()
+
+	f.udpClientsMu.RLock()
+	udpConns := len(f.udpConnIDs)
+	f.udpClientsMu.RUnlock()
+
+	return tcpConns + udpConns
+}

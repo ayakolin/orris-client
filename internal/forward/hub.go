@@ -103,6 +103,9 @@ const (
 	// Config sync message types.
 	MsgTypeConfigSync = "config_sync" // Server -> Agent
 	MsgTypeConfigAck  = "config_ack"  // Agent -> Server
+
+	// Rule sync status message types.
+	MsgTypeRuleSyncStatus = "rule_sync_status" // Agent -> Server
 )
 
 // HubEventType represents the type of event received from hub.
@@ -274,6 +277,18 @@ func (hc *HubConn) SendConfigAck(ack *ConfigAckData) error {
 		Type:      MsgTypeConfigAck,
 		Timestamp: time.Now().Unix(),
 		Data:      ack,
+	}
+	return hc.Send(msg)
+}
+
+// SendRuleSyncStatus sends rule sync status to the server.
+func (hc *HubConn) SendRuleSyncStatus(rules []RuleSyncStatusItem) error {
+	msg := &HubMessage{
+		Type:      MsgTypeRuleSyncStatus,
+		Timestamp: time.Now().Unix(),
+		Data: map[string]any{
+			"rules": rules,
+		},
 	}
 	return hc.Send(msg)
 }

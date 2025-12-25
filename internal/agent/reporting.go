@@ -90,6 +90,8 @@ func (a *Agent) reportStatus() {
 				"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
 				"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
 				"rules", st.ActiveRules)
+			// Report rule sync status via WebSocket
+			a.reportRuleSyncStatus()
 			return
 		}
 	}
@@ -177,4 +179,58 @@ func (a *Agent) reportFinalTraffic() {
 		"rules", len(items),
 		"upload_bytes", totalUpload,
 		"download_bytes", totalDownload)
+}
+
+// reportRuleSyncStatus sends rule sync status to the server via WebSocket.
+func (a *Agent) reportRuleSyncStatus() {
+	a.hubConnMu.RLock()
+	conn := a.hubConn
+	a.hubConnMu.RUnlock()
+
+	if conn == nil {
+		return
+	}
+
+	items := a.collectRuleSyncStatus()
+	if len(items) == 0 {
+		return
+	}
+
+	if err := conn.SendRuleSyncStatus(items); err != nil {
+		logger.Warn("report rule sync status failed", "error", err)
+		return
+	}
+
+	logger.Debug("rule sync status reported", "count", len(items))
+}
+
+// collectRuleSyncStatus collects the current sync and runtime status of all rules.
+func (a *Agent) collectRuleSyncStatus() []forward.RuleSyncStatusItem {
+	// Lock order: forwardersMu -> ruleStatusMu (consistent with syncRules)
+	a.forwardersMu.RLock()
+	a.ruleStatusMu.RLock()
+	defer a.forwardersMu.RUnlock()
+	defer a.ruleStatusMu.RUnlock()
+
+	if len(a.ruleStatus) == 0 {
+		return nil
+	}
+
+	items := make([]forward.RuleSyncStatusItem, 0, len(a.ruleStatus))
+	for ruleID, status := range a.ruleStatus {
+		item := forward.RuleSyncStatusItem{
+			RuleID:       ruleID,
+			SyncStatus:   status.syncStatus,
+			RunStatus:    status.runStatus,
+			ErrorMessage: status.errorMessage,
+			SyncedAt:     status.syncedAt,
+		}
+		// Get dynamic data from forwarder if available
+		if f, ok := a.forwarders[ruleID]; ok {
+			item.ListenPort = f.ListenPort()
+			item.Connections = f.Connections()
+		}
+		items = append(items, item)
+	}
+	return items
 }

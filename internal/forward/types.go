@@ -284,3 +284,28 @@ type TunnelHandshakeResult struct {
 	Error        string `json:"error,omitempty"`
 	EntryAgentID string `json:"entry_agent_id,omitempty"` // Verified entry agent ID (e.g., "fa_xK9mP2vL3nQ")
 }
+
+// RuleSyncStatusItem represents the sync and runtime status of a single forward rule.
+type RuleSyncStatusItem struct {
+	RuleID       string `json:"rule_id"`       // Stripe-style rule ID (e.g., "fr_xK9mP2vL3nQ")
+	SyncStatus   string `json:"sync_status"`   // Sync status: synced, pending, failed
+	RunStatus    string `json:"run_status"`    // Runtime status: running, stopped, error, starting
+	ListenPort   uint16 `json:"listen_port"`   // Actual listening port
+	Connections  int    `json:"connections"`   // Current number of connections
+	ErrorMessage string `json:"error_message"` // Error message if any
+	SyncedAt     int64  `json:"synced_at"`     // Last sync timestamp (Unix seconds)
+}
+
+// Rule sync status constants.
+const (
+	// SyncStatus values.
+	SyncStatusSynced  = "synced"
+	SyncStatusPending = "pending"
+	SyncStatusFailed  = "failed"
+
+	// RunStatus values.
+	RunStatusRunning  = "running"
+	RunStatusStopped  = "stopped"
+	RunStatusError    = "error"
+	RunStatusStarting = "starting"
+)

@@ -10,6 +10,32 @@ import (
 	"github.com/orris-inc/orris-client/internal/tunnel"
 )
 
+// setRuleStatus updates the sync and runtime status of a rule.
+// It also triggers an immediate status report via WebSocket.
+func (a *Agent) setRuleStatus(ruleID, syncStatus, runStatus, errMsg string) {
+	a.ruleStatusMu.Lock()
+	if a.ruleStatus[ruleID] == nil {
+		a.ruleStatus[ruleID] = &ruleStatus{}
+	}
+	a.ruleStatus[ruleID].syncStatus = syncStatus
+	a.ruleStatus[ruleID].runStatus = runStatus
+	a.ruleStatus[ruleID].errorMessage = errMsg
+	if syncStatus == forward.SyncStatusSynced {
+		a.ruleStatus[ruleID].syncedAt = time.Now().Unix()
+	}
+	a.ruleStatusMu.Unlock()
+
+	// Trigger immediate status report (async to avoid blocking)
+	go a.reportRuleSyncStatus()
+}
+
+// deleteRuleStatus removes the status entry for a rule.
+func (a *Agent) deleteRuleStatus(ruleID string) {
+	a.ruleStatusMu.Lock()
+	defer a.ruleStatusMu.Unlock()
+	delete(a.ruleStatus, ruleID)
+}
+
 // syncLoop is a fallback mechanism for rule synchronization.
 // Primary sync is done via WebSocket events from hub, but this loop ensures
 // rules are eventually consistent even if WebSocket connection is unstable.
@@ -89,6 +115,7 @@ func (a *Agent) syncRules() error {
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
 			f.Stop()
 			delete(a.forwarders, ruleID)
+			a.deleteRuleStatus(ruleID)
 		} else if oldRule, hadOld := oldRules[ruleID]; hadOld && ruleConfigChanged(oldRule, newRule) {
 			// Rule exists but config changed - need restart
 			logger.Info("stopping forwarder for changed rule", "rule_id", ruleID)
@@ -124,12 +151,16 @@ func (a *Agent) syncRules() error {
 }
 
 func (a *Agent) startForwarder(rule *forward.Rule) error {
+	// Set initial status: pending sync, starting run
+	a.setRuleStatus(rule.ID, forward.SyncStatusPending, forward.RunStatusStarting, "")
+
 	var f forwarder.Forwarder
 
 	switch rule.RuleType {
 	case forward.RuleTypeDirect:
 		df := forwarder.NewDirectForwarder(rule)
 		if err := df.Start(a.ctx); err != nil {
+			a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 			return err
 		}
 		f = df
@@ -149,10 +180,14 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			} else if rule.NextHopAgentID != "" {
 				t, err = a.getOrCreateTunnel(rule)
 			} else {
-				return fmt.Errorf("entry rule missing next hop info")
+				err := fmt.Errorf("entry rule missing next hop info")
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+				return err
 			}
 			if err != nil {
-				return fmt.Errorf("create tunnel: %w", err)
+				errMsg := fmt.Errorf("create tunnel: %w", err)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+				return errMsg
 			}
 
 			ef := forwarder.NewEntryForwarder(rule, t)
@@ -162,6 +197,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				if stopErr := t.Stop(); stopErr != nil {
 					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
 				}
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 			f = ef
@@ -170,6 +206,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			// Exit role: accept tunnel connections and forward to target
 			// Start the appropriate tunnel server based on TunnelType
 			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 
@@ -179,12 +216,15 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			if err := ef.Start(a.ctx); err != nil {
 				// Cleanup: remove handler on forwarder start failure
 				server.RemoveHandler(rule.ID)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 			f = ef
 
 		default:
-			return fmt.Errorf("unknown role %q for entry rule", rule.Role)
+			err := fmt.Errorf("unknown role %q for entry rule", rule.Role)
+			a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+			return err
 		}
 
 	case forward.RuleTypeChain:
@@ -194,7 +234,9 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			// Chain entry: connect to next hop
 			t, err := a.getOrCreateTunnelByAddress(rule)
 			if err != nil {
-				return fmt.Errorf("create tunnel to next hop: %w", err)
+				errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+				return errMsg
 			}
 
 			ef := forwarder.NewEntryForwarder(rule, t)
@@ -204,6 +246,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				if stopErr := t.Stop(); stopErr != nil {
 					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
 				}
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 			f = ef
@@ -212,13 +255,16 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			// Chain relay: accept from previous hop, forward to next hop
 			// Start the appropriate tunnel server based on TunnelType
 			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 
 			// Connect to next hop
 			t, err := a.getOrCreateTunnelByAddress(rule)
 			if err != nil {
-				return fmt.Errorf("create tunnel to next hop: %w", err)
+				errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+				return errMsg
 			}
 
 			rf := forwarder.NewRelayForwarder(rule, t)
@@ -230,6 +276,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
 				}
 				server.RemoveHandler(rule.ID)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 			f = rf
@@ -238,6 +285,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			// Chain exit: accept from previous hop, forward to target
 			// Start the appropriate tunnel server based on TunnelType
 			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 
@@ -247,12 +295,15 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			if err := ef.Start(a.ctx); err != nil {
 				// Cleanup: remove handler on forwarder start failure
 				server.RemoveHandler(rule.ID)
+				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
 			f = ef
 
 		default:
-			return fmt.Errorf("unknown role %q for chain rule", rule.Role)
+			err := fmt.Errorf("unknown role %q for chain rule", rule.Role)
+			a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+			return err
 		}
 
 	case forward.RuleTypeDirectChain:
@@ -261,17 +312,23 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		// The difference is in NextHopAddress/NextHopPort vs TargetAddress/TargetPort
 		dcf := forwarder.NewDirectChainForwarder(rule)
 		if err := dcf.Start(a.ctx); err != nil {
+			a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 			return err
 		}
 		f = dcf
 
 	default:
-		return fmt.Errorf("unknown rule type: %s", rule.RuleType)
+		err := fmt.Errorf("unknown rule type: %s", rule.RuleType)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return err
 	}
 
 	a.forwardersMu.Lock()
 	a.forwarders[rule.ID] = f
 	a.forwardersMu.Unlock()
+
+	// Set success status: synced and running
+	a.setRuleStatus(rule.ID, forward.SyncStatusSynced, forward.RunStatusRunning, "")
 
 	logger.Info("forwarder started", "rule_id", rule.ID, "rule_type", rule.RuleType, "tunnel_type", rule.TunnelType)
 	return nil
@@ -279,7 +336,9 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 
 // stopForwarder stops and removes a forwarder by rule ID.
 // Acquires locks in order: forwardersMu -> tunnelsMu
-func (a *Agent) stopForwarder(ruleID string) {
+// If updateStatus is true, sets the rule status to stopped after stopping.
+// Pass false when the rule is being removed or will be restarted immediately.
+func (a *Agent) stopForwarder(ruleID string, updateStatus bool) {
 	// Acquire both locks in correct order to prevent deadlock
 	a.forwardersMu.Lock()
 	a.tunnelsMu.Lock()
@@ -299,6 +358,11 @@ func (a *Agent) stopForwarder(ruleID string) {
 
 	a.tunnelsMu.Unlock()
 	a.forwardersMu.Unlock()
+
+	// Update status: synced but stopped (skip if rule is being removed or restarted)
+	if updateStatus {
+		a.setRuleStatus(ruleID, forward.SyncStatusSynced, forward.RunStatusStopped, "")
+	}
 }
 
 // stopAll stops all forwarders and tunnels.

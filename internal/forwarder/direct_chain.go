@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
@@ -28,6 +29,9 @@ type DirectChainForwarder struct {
 	// UDP client tracking for response routing
 	udpClientsMu sync.RWMutex
 	udpClients   map[string]*udpClient // client addr -> upstream conn
+
+	// Active TCP connections counter
+	activeConns atomic.Int32
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -211,6 +215,9 @@ func (f *DirectChainForwarder) tcpAcceptLoop(nextHop string) {
 func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string) {
 	defer f.wg.Done()
 	defer clientConn.Close()
+
+	f.activeConns.Add(1)
+	defer f.activeConns.Add(-1)
 
 	// Check circuit breaker before attempting dial
 	if !f.cb.Allow() {
@@ -486,4 +493,31 @@ func (f *DirectChainForwarder) removeUDPClient(key string) {
 		client.upstream.Close()
 		delete(f.udpClients, key)
 	}
+}
+
+// ListenPort returns the actual listening port from the listener or UDP connection.
+func (f *DirectChainForwarder) ListenPort() uint16 {
+	if f.tcpListener != nil {
+		if addr, ok := f.tcpListener.Addr().(*net.TCPAddr); ok {
+			return uint16(addr.Port)
+		}
+	}
+	if f.udpConn != nil {
+		if addr, ok := f.udpConn.LocalAddr().(*net.UDPAddr); ok {
+			return uint16(addr.Port)
+		}
+	}
+	return 0
+}
+
+// Connections returns the current number of active TCP connections.
+// For UDP, returns the number of tracked client connections.
+func (f *DirectChainForwarder) Connections() int {
+	tcpConns := int(f.activeConns.Load())
+
+	f.udpClientsMu.RLock()
+	udpConns := len(f.udpClients)
+	f.udpClientsMu.RUnlock()
+
+	return tcpConns + udpConns
 }

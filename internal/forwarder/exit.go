@@ -446,3 +446,21 @@ func (f *ExitForwarder) cleanupIdleUDPClients() {
 		}
 	}
 }
+
+// ListenPort returns 0 as ExitForwarder does not have a listening port.
+func (f *ExitForwarder) ListenPort() uint16 {
+	return 0
+}
+
+// Connections returns the current number of active connections (TCP + UDP).
+func (f *ExitForwarder) Connections() int {
+	f.connMu.RLock()
+	tcpConns := len(f.conns)
+	f.connMu.RUnlock()
+
+	f.udpConnsMu.RLock()
+	udpConns := len(f.udpConns)
+	f.udpConnsMu.RUnlock()
+
+	return tcpConns + udpConns
+}
