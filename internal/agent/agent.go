@@ -50,6 +50,9 @@ type Agent struct {
 	tlsTunnelServer   *tunnel.TLSServer
 	configVersion     uint64 // current config version from server
 
+	hubConnMu sync.RWMutex     // protects hubConn access
+	hubConn   *forward.HubConn // current hub WebSocket connection
+
 	ctx      context.Context
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup

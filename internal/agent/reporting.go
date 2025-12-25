@@ -77,12 +77,30 @@ func (a *Agent) reportStatus() {
 		st.TlsListenPort = a.cfg.TlsListenPort
 	}
 
+	// Report status via WebSocket if hub connection is available
+	a.hubConnMu.RLock()
+	conn := a.hubConn
+	a.hubConnMu.RUnlock()
+
+	if conn != nil {
+		if err := conn.SendStatus(st); err != nil {
+			logger.Warn("report status via websocket failed, falling back to HTTP", "error", err)
+		} else {
+			logger.Debug("status reported via websocket",
+				"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
+				"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
+				"rules", st.ActiveRules)
+			return
+		}
+	}
+
+	// Fallback to HTTP POST when WebSocket is not available or failed
 	if err := a.client.ReportStatus(a.ctx, st); err != nil {
-		logger.Error("report status failed", "error", err)
+		logger.Error("report status via HTTP failed", "error", err)
 		return
 	}
 
-	logger.Debug("status reported",
+	logger.Debug("status reported via HTTP",
 		"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
 		"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
 		"rules", st.ActiveRules)

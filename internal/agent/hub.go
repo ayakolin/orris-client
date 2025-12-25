@@ -73,7 +73,17 @@ func (a *Agent) runHubOnce(reconnectCfg *forward.ReconnectConfig) error {
 	if err != nil {
 		return fmt.Errorf("connect hub: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		a.hubConnMu.Lock()
+		a.hubConn = nil
+		a.hubConnMu.Unlock()
+		conn.Close()
+	}()
+
+	// Store hubConn for status reporting via WebSocket
+	a.hubConnMu.Lock()
+	a.hubConn = conn
+	a.hubConnMu.Unlock()
 
 	if reconnectCfg.OnConnected != nil {
 		reconnectCfg.OnConnected()
@@ -206,18 +216,33 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 		a.clientToken = data.ClientToken
 	}
 
+	// Build old rules map for comparison (detect changed rules)
+	oldRules := make(map[string]*forward.Rule)
+	for i := range a.rules {
+		oldRules[a.rules[i].ID] = &a.rules[i]
+	}
+
 	// Update rules list for tunnel server
 	a.rules = make([]forward.Rule, 0, len(newRules))
 	for _, rule := range newRules {
 		a.rules = append(a.rules, *rule)
 	}
 
-	// Stop forwarders not in new rules
+	// Collect forwarders to restart (rule exists but config changed)
+	var toRestart []*forward.Rule
 	for ruleID, f := range a.forwarders {
-		if _, exists := newRules[ruleID]; !exists {
+		newRule, exists := newRules[ruleID]
+		if !exists {
+			// Rule removed
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
 			f.Stop()
 			delete(a.forwarders, ruleID)
+		} else if oldRule, hadOld := oldRules[ruleID]; hadOld && ruleConfigChanged(oldRule, newRule) {
+			// Rule exists but config changed - need restart
+			logger.Info("stopping forwarder for changed rule", "rule_id", ruleID)
+			f.Stop()
+			delete(a.forwarders, ruleID)
+			toRestart = append(toRestart, newRule)
 		}
 	}
 
@@ -234,6 +259,13 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 		a.tunnelServer.UpdateRules(rulesCopy)
 	}
 
+	// Restart forwarders with changed config
+	for _, rule := range toRestart {
+		if err := a.startForwarder(rule); err != nil {
+			logger.Error("restart forwarder failed", "rule_id", rule.ID, "error", err)
+		}
+	}
+
 	// Start forwarders for new rules
 	for _, rule := range newRules {
 		a.forwardersMu.RLock()
@@ -248,6 +280,26 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 	}
 
 	return nil
+}
+
+// ruleConfigChanged checks if rule configuration that affects forwarder behavior has changed.
+// Returns true if the forwarder needs to be restarted.
+func ruleConfigChanged(old, new *forward.Rule) bool {
+	// Check connection-related fields
+	if old.NextHopAddress != new.NextHopAddress ||
+		old.NextHopPort != new.NextHopPort ||
+		old.NextHopWsPort != new.NextHopWsPort ||
+		old.NextHopTlsPort != new.NextHopTlsPort ||
+		old.TargetAddress != new.TargetAddress ||
+		old.TargetPort != new.TargetPort ||
+		old.BindIP != new.BindIP ||
+		old.ListenPort != new.ListenPort ||
+		old.Protocol != new.Protocol ||
+		old.TunnelType != new.TunnelType ||
+		old.IsLastInChain != new.IsLastInChain {
+		return true
+	}
+	return false
 }
 
 // handleIncrementalSync handles incremental configuration sync.

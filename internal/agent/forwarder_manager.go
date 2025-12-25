@@ -47,7 +47,13 @@ func (a *Agent) syncRules() error {
 	rules := resp.Rules
 	logger.Info("rules synced successfully", "count", len(rules))
 
-	// Save client token and rules for handshake verification
+	// Build new rules map
+	ruleMap := make(map[string]*forward.Rule)
+	for i := range rules {
+		ruleMap[rules[i].ID] = &rules[i]
+	}
+
+	// Save client token and build old rules map for comparison
 	a.rulesMu.Lock()
 	if resp.ClientToken != "" {
 		a.clientToken = resp.ClientToken
@@ -55,6 +61,13 @@ func (a *Agent) syncRules() error {
 	} else {
 		logger.Debug("API returned empty clientToken")
 	}
+
+	// Build old rules map for comparison (detect changed rules)
+	oldRules := make(map[string]*forward.Rule)
+	for i := range a.rules {
+		oldRules[a.rules[i].ID] = &a.rules[i]
+	}
+
 	a.rules = rules
 	a.rulesMu.Unlock()
 
@@ -66,21 +79,32 @@ func (a *Agent) syncRules() error {
 		a.tlsTunnelServer.UpdateRules(rules)
 	}
 
-	ruleMap := make(map[string]*forward.Rule)
-	for i := range rules {
-		ruleMap[rules[i].ID] = &rules[i]
-	}
-
-	// Stop forwarders for removed rules
+	// Stop forwarders for removed or changed rules
+	var toRestart []*forward.Rule
 	a.forwardersMu.Lock()
 	for ruleID, f := range a.forwarders {
-		if _, exists := ruleMap[ruleID]; !exists {
+		newRule, exists := ruleMap[ruleID]
+		if !exists {
+			// Rule removed
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
 			f.Stop()
 			delete(a.forwarders, ruleID)
+		} else if oldRule, hadOld := oldRules[ruleID]; hadOld && ruleConfigChanged(oldRule, newRule) {
+			// Rule exists but config changed - need restart
+			logger.Info("stopping forwarder for changed rule", "rule_id", ruleID)
+			f.Stop()
+			delete(a.forwarders, ruleID)
+			toRestart = append(toRestart, newRule)
 		}
 	}
 	a.forwardersMu.Unlock()
+
+	// Restart forwarders with changed config
+	for _, rule := range toRestart {
+		if err := a.startForwarder(rule); err != nil {
+			logger.Error("restart forwarder failed", "rule_id", rule.ID, "error", err)
+		}
+	}
 
 	// Start forwarders for new rules
 	for _, rule := range rules {
