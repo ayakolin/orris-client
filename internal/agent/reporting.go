@@ -69,9 +69,12 @@ func (a *Agent) reportStatus() {
 
 	a.collector.SetTunnelStatus(st, tunnelStatus)
 
-	// Set WS listen port if configured (for exit/relay agents)
+	// Set tunnel listen ports if configured (for exit/relay agents)
 	if a.cfg.WsListenPort > 0 {
 		st.WsListenPort = a.cfg.WsListenPort
+	}
+	if a.cfg.TlsListenPort > 0 {
+		st.TlsListenPort = a.cfg.TlsListenPort
 	}
 
 	if err := a.client.ReportStatus(a.ctx, st); err != nil {

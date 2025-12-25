@@ -24,11 +24,12 @@ var (
 
 func main() {
 	var (
-		serverURL    = flag.StringP("server", "u", "", "server URL")
-		token        = flag.StringP("token", "t", "", "bearer token")
-		wsListenPort = flag.Uint16P("ws-port", "w", 0, "WebSocket listen port for tunnel (0 = random)")
-		logLevel     = flag.StringP("loglevel", "l", "info", "log level (debug, info, warn, error)")
-		showVersion  = flag.BoolP("version", "v", false, "show version and exit")
+		serverURL     = flag.StringP("server", "u", "", "server URL")
+		token         = flag.StringP("token", "t", "", "bearer token")
+		wsListenPort  = flag.Uint16P("ws-port", "w", 0, "WebSocket listen port for tunnel (0 = random)")
+		tlsListenPort = flag.Uint16P("tls-port", "", 0, "TLS listen port for tunnel (0 = random)")
+		logLevel      = flag.StringP("loglevel", "l", "info", "log level (debug, info, warn, error)")
+		showVersion   = flag.BoolP("version", "v", false, "show version and exit")
 	)
 	flag.Parse()
 
@@ -59,6 +60,9 @@ func main() {
 	}
 	if *wsListenPort != 0 {
 		cfg.WsListenPort = *wsListenPort
+	}
+	if *tlsListenPort != 0 {
+		cfg.TlsListenPort = *tlsListenPort
 	}
 
 	if cfg.Token == "" {

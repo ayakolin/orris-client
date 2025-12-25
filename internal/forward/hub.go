@@ -142,11 +142,13 @@ type RuleSyncData struct {
 	TargetPort             uint16   `json:"target_port,omitempty"`
 	BindIP                 string   `json:"bind_ip,omitempty"` // Bind IP address for outbound connections
 	Protocol               string   `json:"protocol"`
+	TunnelType             string   `json:"tunnel_type,omitempty"` // Tunnel type: "ws" or "tls" (default: "ws")
 	Role                   string   `json:"role,omitempty"`
 	AgentID                string   `json:"agent_id,omitempty"` // Entry agent ID (for exit agents to verify handshake)
 	NextHopAgentID         string   `json:"next_hop_agent_id,omitempty"`
 	NextHopAddress         string   `json:"next_hop_address,omitempty"`
 	NextHopWsPort          uint16   `json:"next_hop_ws_port,omitempty"`
+	NextHopTlsPort         uint16   `json:"next_hop_tls_port,omitempty"`         // Next agent's TLS port
 	NextHopPort            uint16   `json:"next_hop_port,omitempty"`             // Next agent's listen port for direct_chain
 	NextHopConnectionToken string   `json:"next_hop_connection_token,omitempty"` // Short-term token for next hop authentication
 	ChainAgentIDs          []string `json:"chain_agent_ids,omitempty"`

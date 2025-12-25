@@ -32,7 +32,9 @@ func tokenPrefix(token string) string {
 	return token[:10] + "..."
 }
 
-func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
+// getOrCreateTunnel creates a tunnel connection using TunnelType from rule.
+// Returns TunnelClient interface that can be either WS or TLS client.
+func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
 
@@ -55,7 +57,25 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
 
-	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(endpoint.Address, fmt.Sprintf("%d", endpoint.WsPort)))
+	var t tunnel.TunnelClient
+
+	// Create tunnel based on TunnelType
+	if rule.TunnelType.IsTLS() {
+		t, err = a.createTLSClient(rule, endpoint.Address, endpoint.TlsPort, agentID)
+	} else {
+		t, err = a.createWSClient(rule, endpoint.Address, endpoint.WsPort, agentID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	a.tunnels[rule.ID] = t
+	return t, nil
+}
+
+// createWSClient creates a WebSocket tunnel client.
+func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.Client, error) {
+	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
@@ -78,16 +98,46 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 	t := tunnel.NewClient(wsURL, a.getHandshakeToken(), rule.ID, opts...)
 
 	if err := t.Start(a.ctx); err != nil {
-		return nil, fmt.Errorf("start tunnel: %w", err)
+		return nil, fmt.Errorf("start ws tunnel: %w", err)
 	}
 
-	a.tunnels[rule.ID] = t
+	return t, nil
+}
+
+// createTLSClient creates a TLS tunnel client using utls.
+func (a *Agent) createTLSClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.TLSClient, error) {
+	endpoint := net.JoinHostPort(address, fmt.Sprintf("%d", port))
+
+	// Create endpoint refresher to handle exit agent restarts with port changes
+	refresher := func() (string, string, error) {
+		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
+		if err != nil {
+			return "", "", err
+		}
+		newEndpoint := net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.TlsPort))
+		return newEndpoint, a.getHandshakeToken(), nil
+	}
+
+	// Build client options
+	opts := []tunnel.TLSClientOption{
+		tunnel.WithTLSHeartbeatInterval(30 * time.Second),
+		tunnel.WithTLSEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
+		tunnel.WithTLSInitialRetry(6),                 // retry up to 6 times for initial connection
+	}
+
+	// Use agent's own token for handshake authentication (prefer API-provided token)
+	t := tunnel.NewTLSClient(endpoint, a.getHandshakeToken(), rule.ID, opts...)
+
+	if err := t.Start(a.ctx); err != nil {
+		return nil, fmt.Errorf("start tls tunnel: %w", err)
+	}
+
 	return t, nil
 }
 
 // getOrCreateTunnelByAddress creates a tunnel connection to a specific address.
 // Used for chain rules where the next hop address is explicitly provided.
-func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, error) {
+func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (tunnel.TunnelClient, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
 
@@ -95,8 +145,6 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	if t, exists := a.tunnels[rule.ID]; exists {
 		return t, nil
 	}
-
-	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
 
 	// Use NextHopConnectionToken if available (short-term token for chain authentication),
 	// otherwise fall back to agent's own token (prefer API-provided token)
@@ -109,6 +157,27 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 		logger.Debug("using NextHopConnectionToken",
 			"rule_id", rule.ID, "token_prefix", tokenPrefix(token))
 	}
+
+	var t tunnel.TunnelClient
+	var err error
+
+	// Create tunnel based on TunnelType
+	if rule.TunnelType.IsTLS() {
+		t, err = a.createTLSClientByAddress(rule, token)
+	} else {
+		t, err = a.createWSClientByAddress(rule, token)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	a.tunnels[rule.ID] = t
+	return t, nil
+}
+
+// createWSClientByAddress creates a WebSocket tunnel client using explicit address.
+func (a *Agent) createWSClientByAddress(rule *forward.Rule, token string) (*tunnel.Client, error) {
+	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
 
 	// Create endpoint refresher for chain rules
 	ruleID := rule.ID
@@ -147,10 +216,55 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	t := tunnel.NewClient(wsURL, token, rule.ID, opts...)
 
 	if err := t.Start(a.ctx); err != nil {
-		return nil, fmt.Errorf("start tunnel: %w", err)
+		return nil, fmt.Errorf("start ws tunnel: %w", err)
 	}
 
-	a.tunnels[rule.ID] = t
+	return t, nil
+}
+
+// createTLSClientByAddress creates a TLS tunnel client using explicit address.
+func (a *Agent) createTLSClientByAddress(rule *forward.Rule, token string) (*tunnel.TLSClient, error) {
+	endpoint := net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopTlsPort))
+
+	// Create endpoint refresher for chain rules
+	ruleID := rule.ID
+	refresher := func() (string, string, error) {
+		refreshedRule, err := a.client.RefreshRule(a.ctx, ruleID)
+		if err != nil {
+			return "", "", fmt.Errorf("refresh rule: %w", err)
+		}
+
+		// Update local rule cache
+		a.updateRuleCache(refreshedRule)
+
+		newEndpoint := net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopTlsPort))
+
+		// Use refreshed token if available
+		newToken := refreshedRule.NextHopConnectionToken
+		if newToken == "" {
+			newToken = a.getHandshakeToken()
+		}
+
+		logger.Info("tls endpoint refreshed for chain rule",
+			"rule_id", ruleID,
+			"new_endpoint", newEndpoint)
+
+		return newEndpoint, newToken, nil
+	}
+
+	// Build client options
+	opts := []tunnel.TLSClientOption{
+		tunnel.WithTLSHeartbeatInterval(30 * time.Second),
+		tunnel.WithTLSEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
+		tunnel.WithTLSInitialRetry(6),                 // retry up to 6 times for initial connection
+	}
+
+	t := tunnel.NewTLSClient(endpoint, token, rule.ID, opts...)
+
+	if err := t.Start(a.ctx); err != nil {
+		return nil, fmt.Errorf("start tls tunnel: %w", err)
+	}
+
 	return t, nil
 }
 
@@ -168,20 +282,12 @@ func (a *Agent) updateRuleCache(rule *forward.Rule) {
 	}
 }
 
-// ensureTunnelServer ensures the tunnel server is started.
+// ensureTunnelServer ensures the WebSocket tunnel server is started.
 // If WsListenPort is 0, a random available port will be used.
-// Uses double-check locking to prevent race conditions.
 func (a *Agent) ensureTunnelServer() error {
-	// Fast path: check without lock
-	if a.tunnelServer != nil {
-		return nil
-	}
-
-	// Slow path: acquire lock and double-check
 	a.tunnelServerMu.Lock()
 	defer a.tunnelServerMu.Unlock()
 
-	// Double-check: another goroutine may have created it
 	if a.tunnelServer != nil {
 		return nil
 	}
@@ -189,7 +295,7 @@ func (a *Agent) ensureTunnelServer() error {
 	// Pass forward.Client for server-side handshake verification
 	server := tunnel.NewServer(a.cfg.WsListenPort, a.client.ForwardClient(), a.rules)
 	if err := server.Start(a.ctx); err != nil {
-		return fmt.Errorf("start tunnel server: %w", err)
+		return fmt.Errorf("start ws tunnel server: %w", err)
 	}
 
 	a.tunnelServer = server
@@ -201,4 +307,47 @@ func (a *Agent) ensureTunnelServer() error {
 	go a.reportStatus()
 
 	return nil
+}
+
+// ensureTlsTunnelServer ensures the TLS tunnel server is started.
+// If TlsListenPort is 0, a random available port will be used.
+func (a *Agent) ensureTlsTunnelServer() error {
+	a.tlsTunnelServerMu.Lock()
+	defer a.tlsTunnelServerMu.Unlock()
+
+	if a.tlsTunnelServer != nil {
+		return nil
+	}
+
+	// Pass forward.Client for server-side handshake verification
+	server := tunnel.NewTLSServer(a.cfg.TlsListenPort, a.client.ForwardClient(), a.rules)
+	if err := server.Start(a.ctx); err != nil {
+		return fmt.Errorf("start tls tunnel server: %w", err)
+	}
+
+	a.tlsTunnelServer = server
+
+	// Update config with actual port (important when port was 0)
+	a.cfg.TlsListenPort = a.tlsTunnelServer.Port()
+
+	// Immediately report status with new port so entry agents can reconnect
+	go a.reportStatus()
+
+	return nil
+}
+
+// ensureTunnelServerByType ensures the appropriate tunnel server is started based on TunnelType.
+func (a *Agent) ensureTunnelServerByType(tunnelType forward.TunnelType) error {
+	if tunnelType.IsTLS() {
+		return a.ensureTlsTunnelServer()
+	}
+	return a.ensureTunnelServer()
+}
+
+// getTunnelServer returns the appropriate tunnel server based on TunnelType.
+func (a *Agent) getTunnelServer(tunnelType forward.TunnelType) tunnel.TunnelServer {
+	if tunnelType.IsTLS() {
+		return a.tlsTunnelServer
+	}
+	return a.tunnelServer
 }

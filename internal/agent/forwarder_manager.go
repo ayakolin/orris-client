@@ -58,9 +58,12 @@ func (a *Agent) syncRules() error {
 	a.rules = rules
 	a.rulesMu.Unlock()
 
-	// Update tunnel server rules if exists
+	// Update tunnel servers' rules if they exist
 	if a.tunnelServer != nil {
 		a.tunnelServer.UpdateRules(rules)
+	}
+	if a.tlsTunnelServer != nil {
+		a.tlsTunnelServer.UpdateRules(rules)
 	}
 
 	ruleMap := make(map[string]*forward.Rule)
@@ -112,7 +115,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Entry role: establish tunnel to exit agent
-			var t *tunnel.Client
+			var t tunnel.TunnelClient
 			var err error
 
 			// If NextHopAddress is already provided, use it directly
@@ -141,15 +144,17 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 
 		case "exit":
 			// Exit role: accept tunnel connections and forward to target
-			if err := a.ensureTunnelServer(); err != nil {
+			// Start the appropriate tunnel server based on TunnelType
+			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
 				return err
 			}
 
 			ef := forwarder.NewExitForwarder(rule)
-			a.tunnelServer.AddHandler(rule.ID, ef)
+			server := a.getTunnelServer(rule.TunnelType)
+			server.AddHandler(rule.ID, ef)
 			if err := ef.Start(a.ctx); err != nil {
 				// Cleanup: remove handler on forwarder start failure
-				a.tunnelServer.RemoveHandler(rule.ID)
+				server.RemoveHandler(rule.ID)
 				return err
 			}
 			f = ef
@@ -181,7 +186,8 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 
 		case "relay":
 			// Chain relay: accept from previous hop, forward to next hop
-			if err := a.ensureTunnelServer(); err != nil {
+			// Start the appropriate tunnel server based on TunnelType
+			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
 				return err
 			}
 
@@ -192,28 +198,31 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			}
 
 			rf := forwarder.NewRelayForwarder(rule, t)
-			a.tunnelServer.AddHandler(rule.ID, rf)
+			server := a.getTunnelServer(rule.TunnelType)
+			server.AddHandler(rule.ID, rf)
 			if err := rf.Start(a.ctx); err != nil {
 				// Cleanup: stop tunnel and remove handler on forwarder start failure
 				if stopErr := t.Stop(); stopErr != nil {
 					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
 				}
-				a.tunnelServer.RemoveHandler(rule.ID)
+				server.RemoveHandler(rule.ID)
 				return err
 			}
 			f = rf
 
 		case "exit":
 			// Chain exit: accept from previous hop, forward to target
-			if err := a.ensureTunnelServer(); err != nil {
+			// Start the appropriate tunnel server based on TunnelType
+			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
 				return err
 			}
 
 			ef := forwarder.NewExitForwarder(rule)
-			a.tunnelServer.AddHandler(rule.ID, ef)
+			server := a.getTunnelServer(rule.TunnelType)
+			server.AddHandler(rule.ID, ef)
 			if err := ef.Start(a.ctx); err != nil {
 				// Cleanup: remove handler on forwarder start failure
-				a.tunnelServer.RemoveHandler(rule.ID)
+				server.RemoveHandler(rule.ID)
 				return err
 			}
 			f = ef
@@ -240,7 +249,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 	a.forwarders[rule.ID] = f
 	a.forwardersMu.Unlock()
 
-	logger.Info("forwarder started", "rule_id", rule.ID, "rule_type", rule.RuleType)
+	logger.Info("forwarder started", "rule_id", rule.ID, "rule_type", rule.RuleType, "tunnel_type", rule.TunnelType)
 	return nil
 }
 
@@ -285,15 +294,19 @@ func (a *Agent) stopAll() {
 	for _, t := range a.tunnels {
 		t.Stop()
 	}
-	a.tunnels = make(map[string]*tunnel.Client)
+	a.tunnels = make(map[string]tunnel.TunnelClient)
 
 	a.tunnelsMu.Unlock()
 	a.forwardersMu.Unlock()
 
-	// Stop tunnel server (no lock needed)
+	// Stop tunnel servers (no lock needed)
 	if a.tunnelServer != nil {
 		a.tunnelServer.Stop()
 		a.tunnelServer = nil
+	}
+	if a.tlsTunnelServer != nil {
+		a.tlsTunnelServer.Stop()
+		a.tlsTunnelServer = nil
 	}
 }
 
@@ -329,8 +342,11 @@ func (a *Agent) updateRulesList(data *forward.ConfigSyncData) {
 		a.rules = append(a.rules, *rule)
 	}
 
-	// Update tunnel server
+	// Update tunnel servers
 	if a.tunnelServer != nil {
 		a.tunnelServer.UpdateRules(a.rules)
+	}
+	if a.tlsTunnelServer != nil {
+		a.tlsTunnelServer.UpdateRules(a.rules)
 	}
 }

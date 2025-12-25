@@ -10,6 +10,7 @@ type Config struct {
 	ServerURL       string
 	Token           string
 	WsListenPort    uint16 // WebSocket listen port for tunnel connections (exit agent)
+	TlsListenPort   uint16 // TLS listen port for tunnel connections (exit agent)
 	SyncInterval    time.Duration
 	TrafficInterval time.Duration
 	StatusInterval  time.Duration
@@ -39,6 +40,11 @@ func LoadFromEnv() *Config {
 	if v := os.Getenv("ORRIS_WS_LISTEN_PORT"); v != "" {
 		if port, err := strconv.ParseUint(v, 10, 16); err == nil {
 			cfg.WsListenPort = uint16(port)
+		}
+	}
+	if v := os.Getenv("ORRIS_TLS_LISTEN_PORT"); v != "" {
+		if port, err := strconv.ParseUint(v, 10, 16); err == nil {
+			cfg.TlsListenPort = uint16(port)
 		}
 	}
 

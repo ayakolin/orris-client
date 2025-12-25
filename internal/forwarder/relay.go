@@ -22,14 +22,22 @@ type closedEntry struct {
 	closedAt int64 // Unix nano timestamp
 }
 
-// RelayForwarder handles relay forwarding (WS tunnel inbound -> WS tunnel outbound).
+// OutboundTunnel is the interface for outbound tunnel connections.
+// Both WebSocket and TLS tunnel clients implement this interface.
+type OutboundTunnel interface {
+	tunnel.Sender
+	SetHandler(h tunnel.DataHandler)
+	IsConnected() bool
+}
+
+// RelayForwarder handles relay forwarding (tunnel inbound -> tunnel outbound).
 // It bridges data between two tunnel connections in a chain.
 type RelayForwarder struct {
 	rule    *forward.Rule
 	traffic *TrafficCounter
 
 	inbound  tunnel.Sender  // sender to previous hop (set by tunnel.Server)
-	outbound *tunnel.Client // client to next hop
+	outbound OutboundTunnel // client to next hop (WS or TLS)
 
 	closedMu sync.RWMutex
 	closed   map[uint64]*closedEntry // track closed connections to avoid loops
@@ -40,7 +48,7 @@ type RelayForwarder struct {
 }
 
 // NewRelayForwarder creates a new relay forwarder.
-func NewRelayForwarder(rule *forward.Rule, outbound *tunnel.Client) *RelayForwarder {
+func NewRelayForwarder(rule *forward.Rule, outbound OutboundTunnel) *RelayForwarder {
 	return &RelayForwarder{
 		rule:     rule,
 		outbound: outbound,

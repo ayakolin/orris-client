@@ -42,11 +42,13 @@ type Agent struct {
 	forwarders   map[string]forwarder.Forwarder
 
 	tunnelsMu sync.RWMutex
-	tunnels   map[string]*tunnel.Client // ruleID -> tunnel
+	tunnels   map[string]tunnel.TunnelClient // ruleID -> tunnel (WS or TLS)
 
-	tunnelServerMu sync.Mutex // protects tunnelServer initialization
-	tunnelServer   *tunnel.Server
-	configVersion  uint64 // current config version from server
+	tunnelServerMu    sync.Mutex // protects tunnelServer initialization
+	tunnelServer      *tunnel.Server
+	tlsTunnelServerMu sync.Mutex // protects tlsTunnelServer initialization
+	tlsTunnelServer   *tunnel.TLSServer
+	configVersion     uint64 // current config version from server
 
 	ctx      context.Context
 	cancelFn context.CancelFunc
@@ -61,7 +63,7 @@ func New(cfg *config.Config) *Agent {
 		client:     client,
 		collector:  status.NewCollector(),
 		forwarders: make(map[string]forwarder.Forwarder),
-		tunnels:    make(map[string]*tunnel.Client),
+		tunnels:    make(map[string]tunnel.TunnelClient),
 	}
 }
 

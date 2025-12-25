@@ -22,6 +22,26 @@ const (
 	RuleTypeDirectChain RuleType = "direct_chain"
 )
 
+// TunnelType represents the type of tunnel for forwarding traffic.
+type TunnelType string
+
+const (
+	// TunnelTypeWS represents WebSocket tunnel.
+	TunnelTypeWS TunnelType = "ws"
+	// TunnelTypeTLS represents TLS tunnel.
+	TunnelTypeTLS TunnelType = "tls"
+)
+
+// IsWS returns true if this is a WebSocket tunnel (or default).
+func (t TunnelType) IsWS() bool {
+	return t == TunnelTypeWS || t == ""
+}
+
+// IsTLS returns true if this is a TLS tunnel.
+func (t TunnelType) IsTLS() bool {
+	return t == TunnelTypeTLS
+}
+
 // Rule represents a forward rule returned by the API.
 // Note: ws_listen_port field has been removed (exit type deprecated).
 type Rule struct {
@@ -47,6 +67,9 @@ type Rule struct {
 	// Values: "entry" (needs to establish tunnel), "exit" (accepts tunnel connections), "relay" (chain middle node)
 	Role string `json:"role,omitempty"`
 
+	// Tunnel configuration
+	TunnelType TunnelType `json:"tunnel_type,omitempty"` // Tunnel type: "ws" or "tls" (default: "ws")
+
 	// Chain-specific fields (for chain rule type)
 	ChainAgentIDs          []string `json:"chain_agent_ids,omitempty"`           // Ordered list of agent IDs in chain
 	ChainPosition          int      `json:"chain_position,omitempty"`            // Agent's position in chain (0-indexed)
@@ -54,6 +77,7 @@ type Rule struct {
 	NextHopAgentID         string   `json:"next_hop_agent_id,omitempty"`         // Next agent in chain
 	NextHopAddress         string   `json:"next_hop_address,omitempty"`          // Next agent's public address
 	NextHopWsPort          uint16   `json:"next_hop_ws_port,omitempty"`          // Next agent's WS port
+	NextHopTlsPort         uint16   `json:"next_hop_tls_port,omitempty"`         // Next agent's TLS port
 	NextHopPort            uint16   `json:"next_hop_port,omitempty"`             // Next agent's listen port for direct_chain
 	NextHopConnectionToken string   `json:"next_hop_connection_token,omitempty"` // Short-term token for next hop authentication
 }
@@ -112,6 +136,7 @@ func (r *Rule) IsDirectChainExit() bool {
 type ExitEndpoint struct {
 	Address string `json:"address"`
 	WsPort  uint16 `json:"ws_port"`
+	TlsPort uint16 `json:"tls_port"` // TLS tunnel port
 }
 
 // RulesResponse represents the response from GetRules API.
@@ -164,10 +189,11 @@ type AgentStatus struct {
 	ActiveConnections int                    `json:"active_connections"`
 	TunnelStatus      map[string]TunnelState `json:"tunnel_status,omitempty"` // Key is Stripe-style rule ID (e.g., "fr_xK9mP2vL3nQ")
 
-	// WebSocket tunnel configuration (for exit agent)
-	// Note: WsListenPort is now reported directly by the agent in status updates,
+	// Tunnel configuration (for exit agent)
+	// Note: Tunnel ports are now reported directly by the agent in status updates,
 	// not configured per-rule (exit rule type has been removed).
-	WsListenPort uint16 `json:"ws_listen_port,omitempty"` // WebSocket listen port for tunnel connections
+	WsListenPort  uint16 `json:"ws_listen_port,omitempty"`  // WebSocket listen port for tunnel connections
+	TlsListenPort uint16 `json:"tls_listen_port,omitempty"` // TLS listen port for tunnel connections
 }
 
 // TunnelState represents the connection state of a tunnel.
