@@ -69,6 +69,12 @@ type Rule struct {
 
 	// Tunnel configuration
 	TunnelType TunnelType `json:"tunnel_type,omitempty"` // Tunnel type: "ws" or "tls" (default: "ws")
+	TunnelHops *int       `json:"tunnel_hops,omitempty"` // Number of hops using tunnel (nil=full tunnel, N=first N hops use tunnel)
+
+	// Hop mode for hybrid chain (populated based on agent's position)
+	HopMode      string `json:"hop_mode,omitempty"`      // "tunnel", "direct", or "boundary"
+	InboundMode  string `json:"inbound_mode,omitempty"`  // For boundary nodes: "tunnel" or "direct"
+	OutboundMode string `json:"outbound_mode,omitempty"` // For boundary nodes: "tunnel" or "direct"
 
 	// Chain-specific fields (for chain rule type)
 	ChainAgentIDs          []string `json:"chain_agent_ids,omitempty"`           // Ordered list of agent IDs in chain
