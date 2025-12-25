@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -11,7 +12,17 @@ import (
 )
 
 // executeProbe executes a probe task and returns the result.
-func (a *Agent) executeProbe(task *forward.ProbeTask) *forward.ProbeTaskResult {
+func (a *Agent) executeProbe(ctx context.Context, task *forward.ProbeTask) *forward.ProbeTaskResult {
+	switch task.Type {
+	case forward.ProbeTaskTypeTunnelPing:
+		return a.executeTunnelPing(ctx, task)
+	default:
+		return a.executeBasicProbe(task)
+	}
+}
+
+// executeBasicProbe executes target and tunnel probe tasks.
+func (a *Agent) executeBasicProbe(task *forward.ProbeTask) *forward.ProbeTaskResult {
 	result := &forward.ProbeTaskResult{
 		TaskID: task.ID,
 		Type:   task.Type,
@@ -42,6 +53,20 @@ func (a *Agent) executeProbe(task *forward.ProbeTask) *forward.ProbeTaskResult {
 		"type", task.Type,
 		"success", result.Success,
 		"latency_ms", result.LatencyMs)
+
+	return result
+}
+
+// executeTunnelPing executes a tunnel ping probe task.
+func (a *Agent) executeTunnelPing(ctx context.Context, task *forward.ProbeTask) *forward.ProbeTaskResult {
+	result := forward.ExecuteTunnelPing(ctx, task)
+
+	logger.Debug("tunnel ping executed",
+		"task_id", task.ID,
+		"type", task.Type,
+		"success", result.Success,
+		"avg_latency_ms", result.AvgLatencyMs,
+		"packet_loss", result.PacketLoss)
 
 	return result
 }

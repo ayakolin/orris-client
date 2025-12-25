@@ -114,7 +114,7 @@ func (a *Agent) handleHubEvent(conn *forward.HubConn, event *forward.HubEvent) {
 	case forward.HubEventProbeTask:
 		if event.ProbeTask != nil {
 			go func() {
-				result := a.executeProbe(event.ProbeTask)
+				result := a.executeProbe(a.ctx, event.ProbeTask)
 				if result != nil {
 					conn.SendProbeResult(result)
 				}
