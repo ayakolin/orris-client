@@ -301,7 +301,9 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 		old.ListenPort != new.ListenPort ||
 		old.Protocol != new.Protocol ||
 		old.TunnelType != new.TunnelType ||
-		old.IsLastInChain != new.IsLastInChain {
+		old.IsLastInChain != new.IsLastInChain ||
+		old.HopMode != new.HopMode ||
+		old.OutboundMode != new.OutboundMode {
 		return true
 	}
 	return false

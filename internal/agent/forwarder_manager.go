@@ -259,27 +259,41 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				return err
 			}
 
-			// Connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule)
-			if err != nil {
-				errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-				return errMsg
-			}
-
-			rf := forwarder.NewRelayForwarder(rule, t)
 			server := a.getTunnelServer(rule.TunnelType)
-			server.AddHandler(rule.ID, rf)
-			if err := rf.Start(a.ctx); err != nil {
-				// Cleanup: stop tunnel and remove handler on forwarder start failure
-				if stopErr := t.Stop(); stopErr != nil {
-					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+
+			// Check HopMode to determine outbound connection type
+			if rule.HopMode == "boundary" && rule.OutboundMode == "direct" {
+				// Boundary relay: tunnel inbound -> direct outbound
+				brf := forwarder.NewBoundaryRelayForwarder(rule)
+				server.AddHandler(rule.ID, brf)
+				if err := brf.Start(a.ctx); err != nil {
+					server.RemoveHandler(rule.ID)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
 				}
-				server.RemoveHandler(rule.ID)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
+				f = brf
+			} else {
+				// Normal relay: tunnel inbound -> tunnel outbound
+				t, err := a.getOrCreateTunnelByAddress(rule)
+				if err != nil {
+					errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+					return errMsg
+				}
+
+				rf := forwarder.NewRelayForwarder(rule, t)
+				server.AddHandler(rule.ID, rf)
+				if err := rf.Start(a.ctx); err != nil {
+					// Cleanup: stop tunnel and remove handler on forwarder start failure
+					if stopErr := t.Stop(); stopErr != nil {
+						logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+					}
+					server.RemoveHandler(rule.ID)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = rf
 			}
-			f = rf
 
 		case "exit":
 			// Chain exit: accept from previous hop, forward to target
