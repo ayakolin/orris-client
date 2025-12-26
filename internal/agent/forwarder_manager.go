@@ -253,17 +253,24 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 
 		case "relay":
 			// Chain relay: accept from previous hop, forward to next hop
-			// Start the appropriate tunnel server based on TunnelType
-			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
-			}
-
-			server := a.getTunnelServer(rule.TunnelType)
-
-			// Check HopMode to determine outbound connection type
-			if rule.HopMode == "boundary" && rule.OutboundMode == "direct" {
+			// Check HopMode to determine connection types
+			if rule.HopMode == "direct" {
+				// Direct relay: direct inbound -> direct outbound
+				// Uses DirectChainForwarder which handles TCP/UDP listening and forwarding
+				dcf := forwarder.NewDirectChainForwarder(rule)
+				if err := dcf.Start(a.ctx); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = dcf
+			} else if rule.HopMode == "boundary" && rule.OutboundMode == "direct" {
 				// Boundary relay: tunnel inbound -> direct outbound
+				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				server := a.getTunnelServer(rule.TunnelType)
+
 				brf := forwarder.NewBoundaryRelayForwarder(rule)
 				server.AddHandler(rule.ID, brf)
 				if err := brf.Start(a.ctx); err != nil {
@@ -274,6 +281,12 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				f = brf
 			} else {
 				// Normal relay: tunnel inbound -> tunnel outbound
+				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				server := a.getTunnelServer(rule.TunnelType)
+
 				t, err := a.getOrCreateTunnelByAddress(rule)
 				if err != nil {
 					errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
@@ -297,22 +310,34 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 
 		case "exit":
 			// Chain exit: accept from previous hop, forward to target
-			// Start the appropriate tunnel server based on TunnelType
-			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
-			}
+			// Check InboundMode to determine connection type
+			if rule.InboundMode == "direct" || rule.HopMode == "direct" {
+				// Direct exit: direct inbound -> target
+				// Uses DirectChainForwarder with IsLastInChain=true
+				dcf := forwarder.NewDirectChainForwarder(rule)
+				if err := dcf.Start(a.ctx); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = dcf
+			} else {
+				// Normal exit: tunnel inbound -> target
+				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
 
-			ef := forwarder.NewExitForwarder(rule)
-			server := a.getTunnelServer(rule.TunnelType)
-			server.AddHandler(rule.ID, ef)
-			if err := ef.Start(a.ctx); err != nil {
-				// Cleanup: remove handler on forwarder start failure
-				server.RemoveHandler(rule.ID)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
+				ef := forwarder.NewExitForwarder(rule)
+				server := a.getTunnelServer(rule.TunnelType)
+				server.AddHandler(rule.ID, ef)
+				if err := ef.Start(a.ctx); err != nil {
+					// Cleanup: remove handler on forwarder start failure
+					server.RemoveHandler(rule.ID)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = ef
 			}
-			f = ef
 
 		default:
 			err := fmt.Errorf("unknown role %q for chain rule", rule.Role)
