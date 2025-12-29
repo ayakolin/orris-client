@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -96,20 +97,33 @@ func (s *Server) RemoveHandler(ruleID string) {
 	s.handlerMu.Unlock()
 }
 
-// Start starts the tunnel server.
+// Start starts the tunnel server with TLS.
 // If port is 0, a random available port will be used.
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// Create listener first to get the actual port (supports port 0 for random)
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
+	// Generate self-signed certificate for TLS
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		return fmt.Errorf("generate cert: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Create TCP listener first to get the actual port (supports port 0 for random)
+	tcpListener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	s.listener = listener
+
+	// Wrap with TLS
+	s.listener = tls.NewListener(tcpListener, tlsConfig)
 
 	// Update port with the actual port (important when port was 0)
-	s.port = uint16(listener.Addr().(*net.TCPAddr).Port)
+	s.port = uint16(tcpListener.Addr().(*net.TCPAddr).Port)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", s.handleTunnel)
@@ -121,9 +135,9 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		logger.Info("tunnel server started", "port", s.port)
+		logger.Info("wss tunnel server started", "port", s.port)
 		if err := s.server.Serve(s.listener); err != http.ErrServerClosed {
-			logger.Error("tunnel server error", "error", err)
+			logger.Error("wss tunnel server error", "error", err)
 		}
 	}()
 

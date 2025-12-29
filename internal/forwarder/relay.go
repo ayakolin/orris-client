@@ -280,6 +280,25 @@ func (f *RelayForwarder) ListenPort() uint16 {
 	return 0
 }
 
+// IsTunnelConnected returns true if the outbound tunnel is connected.
+func (f *RelayForwarder) IsTunnelConnected() bool {
+	if f.outbound == nil {
+		return false
+	}
+	return f.outbound.IsConnected()
+}
+
+// PingTunnel pings the outbound tunnel and returns the round-trip latency.
+func (f *RelayForwarder) PingTunnel(ctx context.Context) (time.Duration, error) {
+	if f.outbound == nil {
+		return 0, fmt.Errorf("outbound tunnel not initialized")
+	}
+	if pinger, ok := f.outbound.(tunnel.Pinger); ok {
+		return pinger.Ping(ctx)
+	}
+	return 0, fmt.Errorf("outbound tunnel does not support ping")
+}
+
 // Connections returns 0 as RelayForwarder cannot accurately track active connections.
 // Relay mode bridges tunnel connections and does not maintain a connection map.
 func (f *RelayForwarder) Connections() int {

@@ -18,6 +18,11 @@ type DataHandler interface {
 	HandleClose(connID uint64)
 }
 
+// Pinger can ping the tunnel to measure latency.
+type Pinger interface {
+	Ping(ctx context.Context) (time.Duration, error)
+}
+
 // EndpointRefresher refreshes the tunnel endpoint when reconnection fails.
 // It returns the new endpoint URL and token, or an error if refresh fails.
 type EndpointRefresher func() (endpoint, token string, err error)
@@ -34,6 +39,10 @@ type Client struct {
 
 	writeMu sync.Mutex
 	handler DataHandler
+
+	// Ping/Pong for latency measurement
+	pongMu sync.Mutex
+	pongCh chan struct{} // signals pong received
 
 	backoff              *Backoff
 	heartbeatInterval    time.Duration
@@ -144,4 +153,36 @@ func (c *Client) Stop() error {
 // providing thread-safe and accurate connection status.
 func (c *Client) IsConnected() bool {
 	return c.connected.Load()
+}
+
+// Ping sends a ping message and waits for pong response, returning the round-trip latency.
+// Returns an error if not connected, if the ping fails, or if the timeout is exceeded.
+func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
+	if !c.connected.Load() {
+		return 0, fmt.Errorf("not connected")
+	}
+
+	// Create pong channel for this ping request
+	pongCh := make(chan struct{}, 1)
+	c.pongMu.Lock()
+	c.pongCh = pongCh
+	c.pongMu.Unlock()
+
+	defer func() {
+		c.pongMu.Lock()
+		c.pongCh = nil
+		c.pongMu.Unlock()
+	}()
+
+	start := time.Now()
+	if err := c.SendMessage(NewPingMessage()); err != nil {
+		return 0, fmt.Errorf("send ping: %w", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-pongCh:
+		return time.Since(start), nil
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
@@ -178,6 +179,18 @@ func (f *EntryForwarder) IsTunnelConnected() bool {
 	}
 	// If no way to check, assume connected
 	return true
+}
+
+// PingTunnel pings the tunnel and returns the round-trip latency.
+// Returns an error if the tunnel doesn't support ping or is not connected.
+func (f *EntryForwarder) PingTunnel(ctx context.Context) (time.Duration, error) {
+	if f.tunnel == nil {
+		return 0, fmt.Errorf("tunnel not initialized")
+	}
+	if pinger, ok := f.tunnel.(tunnel.Pinger); ok {
+		return pinger.Ping(ctx)
+	}
+	return 0, fmt.Errorf("tunnel does not support ping")
 }
 
 // HandleConnect is not used by EntryForwarder (it initiates connections, not receives).

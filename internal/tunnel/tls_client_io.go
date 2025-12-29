@@ -109,21 +109,31 @@ func (c *TLSClient) readLoop() {
 
 // handleMessage dispatches a received message to the appropriate handler.
 func (c *TLSClient) handleMessage(msg *Message) {
-	c.handlerMu.RLock()
-	h := c.handler
-	c.handlerMu.RUnlock()
-
-	if h == nil {
-		return
-	}
-
 	switch msg.Type {
 	case MsgData:
-		h.HandleData(msg.ConnID, msg.Payload)
+		c.handlerMu.RLock()
+		h := c.handler
+		c.handlerMu.RUnlock()
+		if h != nil {
+			h.HandleData(msg.ConnID, msg.Payload)
+		}
 	case MsgClose:
-		h.HandleClose(msg.ConnID)
+		c.handlerMu.RLock()
+		h := c.handler
+		c.handlerMu.RUnlock()
+		if h != nil {
+			h.HandleClose(msg.ConnID)
+		}
 	case MsgPong:
-		logger.Debug("received tls pong")
+		// Notify Ping() caller if waiting
+		c.pongMu.Lock()
+		if c.pongCh != nil {
+			select {
+			case c.pongCh <- struct{}{}:
+			default:
+			}
+		}
+		c.pongMu.Unlock()
 	default:
 		logger.Warn("unknown tls message type", "type", msg.Type)
 	}

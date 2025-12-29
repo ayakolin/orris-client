@@ -74,17 +74,25 @@ func (c *Client) readLoop() {
 
 // handleMessage dispatches a received message to the appropriate handler.
 func (c *Client) handleMessage(msg *Message) {
-	if c.handler == nil {
-		return
-	}
-
 	switch msg.Type {
 	case MsgData:
-		c.handler.HandleData(msg.ConnID, msg.Payload)
+		if c.handler != nil {
+			c.handler.HandleData(msg.ConnID, msg.Payload)
+		}
 	case MsgClose:
-		c.handler.HandleClose(msg.ConnID)
+		if c.handler != nil {
+			c.handler.HandleClose(msg.ConnID)
+		}
 	case MsgPong:
-		logger.Debug("received pong")
+		// Notify Ping() caller if waiting
+		c.pongMu.Lock()
+		if c.pongCh != nil {
+			select {
+			case c.pongCh <- struct{}{}:
+			default:
+			}
+		}
+		c.pongMu.Unlock()
 	default:
 		logger.Warn("unknown message type", "type", msg.Type)
 	}
