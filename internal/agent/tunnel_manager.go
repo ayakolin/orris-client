@@ -75,7 +75,7 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, erro
 
 // createWSClient creates a WebSocket tunnel client.
 func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.Client, error) {
-	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
+	wsURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
@@ -83,7 +83,7 @@ func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, 
 		if err != nil {
 			return "", "", err
 		}
-		newURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
+		newURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
 		return newURL, a.getHandshakeToken(), nil
 	}
 
@@ -177,7 +177,7 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (tunnel.TunnelCli
 
 // createWSClientByAddress creates a WebSocket tunnel client using explicit address.
 func (a *Agent) createWSClientByAddress(rule *forward.Rule, token string) (*tunnel.Client, error) {
-	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
+	wsURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
 
 	// Create endpoint refresher for chain rules
 	ruleID := rule.ID
@@ -190,7 +190,7 @@ func (a *Agent) createWSClientByAddress(rule *forward.Rule, token string) (*tunn
 		// Update local rule cache
 		a.updateRuleCache(refreshedRule)
 
-		newURL := fmt.Sprintf("ws://%s/tunnel",
+		newURL := fmt.Sprintf("wss://%s/tunnel",
 			net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopWsPort)))
 
 		// Use refreshed token if available

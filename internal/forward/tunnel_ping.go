@@ -6,7 +6,6 @@ package forward
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	utls "github.com/refraction-networking/utls"
 )
 
 // TunnelPingResult contains the results of a tunnel ping operation.
@@ -128,13 +128,29 @@ func (p *TunnelPinger) pingWS(ctx context.Context) *TunnelPingResult {
 		PingsSent: p.pingCount,
 	}
 
-	// Build WebSocket URL - WS tunnel uses plain HTTP (not TLS)
+	// Build WebSocket URL - use wss:// with uTLS
 	hostPort := net.JoinHostPort(p.target, fmt.Sprintf("%d", p.port))
-	wsURL := fmt.Sprintf("ws://%s/tunnel", hostPort)
+	wsURL := fmt.Sprintf("wss://%s/tunnel", hostPort)
 
-	// Create dialer (no TLS config needed for ws://)
+	// Create dialer with uTLS for wss:// connections
 	dialer := websocket.Dialer{
 		HandshakeTimeout: p.connTimeout,
+		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			tcpConn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig := &utls.Config{
+				InsecureSkipVerify: true,
+			}
+			tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
+			if err := tlsConn.Handshake(); err != nil {
+				tcpConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
 	}
 
 	// Parse URL
@@ -275,7 +291,7 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 		PingsSent: p.pingCount,
 	}
 
-	// Connect with TLS (use net.JoinHostPort to handle IPv6 addresses correctly)
+	// Connect with uTLS (use net.JoinHostPort to handle IPv6 addresses correctly)
 	addr := net.JoinHostPort(p.target, fmt.Sprintf("%d", p.port))
 	dialer := &net.Dialer{
 		Timeout: p.connTimeout,
@@ -284,11 +300,19 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 	connCtx, connCancel := context.WithTimeout(ctx, p.connTimeout)
 	defer connCancel()
 
-	tlsConn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	tcpConn, err := dialer.DialContext(connCtx, "tcp", addr)
 	if err != nil {
-		result.Error = fmt.Sprintf("tls dial: %v", err)
+		result.Error = fmt.Sprintf("tcp dial: %v", err)
+		return result
+	}
+
+	tlsConfig := &utls.Config{
+		InsecureSkipVerify: true,
+	}
+	tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
+	if err := tlsConn.Handshake(); err != nil {
+		tcpConn.Close()
+		result.Error = fmt.Sprintf("tls handshake: %v", err)
 		return result
 	}
 	defer tlsConn.Close()
@@ -388,7 +412,7 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 }
 
 // sendTLSPing sends a ping through TLS connection using tunnel protocol and measures RTT.
-func (p *TunnelPinger) sendTLSPing(conn *tls.Conn) (int64, error) {
+func (p *TunnelPinger) sendTLSPing(conn net.Conn) (int64, error) {
 	start := time.Now()
 
 	// Set deadlines

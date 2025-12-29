@@ -1,12 +1,16 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
+	tls "github.com/refraction-networking/utls"
+
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
 )
@@ -91,6 +95,23 @@ func (c *Client) connect() error {
 		HandshakeTimeout: 10 * time.Second,
 		ReadBufferSize:   64 * 1024,
 		WriteBufferSize:  64 * 1024,
+		// Use uTLS for wss:// connections to mimic Chrome fingerprint
+		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			tcpConn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: true, // Exit agent uses self-signed cert
+			}
+			tlsConn := tls.UClient(tcpConn, tlsConfig, tls.HelloChrome_Auto)
+			if err := tlsConn.Handshake(); err != nil {
+				tcpConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
 	}
 
 	header := make(map[string][]string)
