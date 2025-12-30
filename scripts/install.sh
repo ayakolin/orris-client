@@ -177,6 +177,12 @@ install() {
         warn "Service may not be running properly"
     fi
 
+    # Show installed version
+    local installed_version
+    if installed_version=$("${INSTALL_DIR}/${BINARY}" --version 2>/dev/null); then
+        info "Version: $installed_version"
+    fi
+
     echo
     echo "Commands:"
     echo "  Status: systemctl status $SERVICE"
