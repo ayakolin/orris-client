@@ -11,6 +11,7 @@ import (
 	"github.com/shirou/gopsutil/v4/net"
 
 	"github.com/orris-inc/orris-client/internal/forward"
+	"github.com/orris-inc/orris-client/internal/version"
 )
 
 // Collector collects system status information.
@@ -69,6 +70,11 @@ func (c *Collector) Collect(ctx context.Context) (*forward.AgentStatus, error) {
 			}
 		}
 	}
+
+	// Agent info
+	status.AgentVersion = version.Version
+	status.Platform = version.Platform()
+	status.Arch = version.Arch()
 
 	return status, nil
 }

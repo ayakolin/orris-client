@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # Orris Forward Agent Installer
-# Usage: curl -fsSL URL | sudo bash -s -- --server URL --token TOKEN
+# Usage: curl -fsSL URL | sudo bash -s -- -s URL -t TOKEN
 # Uninstall: curl -fsSL URL | sudo bash -s -- uninstall
 # =============================================================================
 
@@ -27,13 +27,17 @@ Commands:
     uninstall    Uninstall the service
 
 Options:
-    --server URL    Server URL (required)
-    --token TOKEN   Agent token (required)
-    --version VER   Specific version (default: latest)
-    -h, --help      Show this help
+    -s, --server URL      Server URL (required)
+    -t, --token TOKEN     Agent token (required)
+    -W, --ws-port PORT    WebSocket listen port (0 = random)
+    -T, --tls-port PORT   TLS listen port (0 = random)
+    -l, --loglevel LEVEL  Log level (debug, info, warn, error)
+        --version VER     Specific version (default: latest)
+    -h, --help            Show this help
 
 Examples:
-    Install:   $0 --server https://api.example.com --token fwd_xxx
+    Install:   $0 -s https://api.example.com -t fwd_xxx
+    Install:   $0 --server https://api.example.com --token fwd_xxx -W 8080
     Uninstall: $0 uninstall
 EOF
     exit 0
@@ -87,6 +91,9 @@ uninstall() {
 create_config() {
     local server="$1"
     local token="$2"
+    local ws_port="$3"
+    local tls_port="$4"
+    local loglevel="$5"
 
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<EOF
@@ -94,6 +101,12 @@ create_config() {
 ORRIS_SERVER_URL=${server}
 ORRIS_TOKEN=${token}
 EOF
+
+    # Add optional parameters if specified
+    [[ -n "$ws_port" ]]  && echo "ORRIS_WS_LISTEN_PORT=${ws_port}" >> "$CONFIG_FILE"
+    [[ -n "$tls_port" ]] && echo "ORRIS_TLS_LISTEN_PORT=${tls_port}" >> "$CONFIG_FILE"
+    [[ -n "$loglevel" ]] && echo "ORRIS_LOG_LEVEL=${loglevel}" >> "$CONFIG_FILE"
+
     chmod 600 "$CONFIG_FILE"
 }
 
@@ -131,7 +144,10 @@ EOF
 install() {
     local server="$1"
     local token="$2"
-    local version="${3:-latest}"
+    local version="$3"
+    local ws_port="$4"
+    local tls_port="$5"
+    local loglevel="$6"
 
     detect_platform
     info "Installing... (OS: $OS, Arch: $ARCH)"
@@ -162,7 +178,7 @@ install() {
     rm -f "${INSTALL_DIR}/${BINARY}.bak"
 
     # Create config and service
-    create_config "$server" "$token"
+    create_config "$server" "$token" "$ws_port" "$tls_port" "$loglevel"
     create_service
 
     # Start service
@@ -197,25 +213,29 @@ install() {
 
 main() {
     local server="" token="" version="latest"
+    local ws_port="" tls_port="" loglevel=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --server)  server="$2"; shift 2 ;;
-            --token)   token="$2"; shift 2 ;;
-            --version) version="$2"; shift 2 ;;
-            -h|--help) usage ;;
-            uninstall) check_root; uninstall ;;
+            -s|--server)   server="$2"; shift 2 ;;
+            -t|--token)    token="$2"; shift 2 ;;
+            -W|--ws-port)  ws_port="$2"; shift 2 ;;
+            -T|--tls-port) tls_port="$2"; shift 2 ;;
+            -l|--loglevel) loglevel="$2"; shift 2 ;;
+            --version)     version="$2"; shift 2 ;;
+            -h|--help)     usage ;;
+            uninstall)     check_root; uninstall ;;
             *) shift ;;
         esac
     done
 
     check_root
 
-    [[ -z "$server" ]] && error "Missing --server URL"
-    [[ -z "$token" ]]  && error "Missing --token TOKEN"
+    [[ -z "$server" ]] && error "Missing -s/--server URL"
+    [[ -z "$token" ]]  && error "Missing -t/--token TOKEN"
 
-    install "$server" "$token" "$version"
+    install "$server" "$token" "$version" "$ws_port" "$tls_port" "$loglevel"
 }
 
 main "$@"

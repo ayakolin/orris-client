@@ -3,8 +3,10 @@
 # Variables
 BINARY_NAME=orris-client
 VERSION?=dev
+COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
-LDFLAGS=-ldflags "-X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}"
+VERSION_PKG=github.com/orris-inc/orris-client/internal/version
+LDFLAGS=-ldflags "-X ${VERSION_PKG}.Version=${VERSION} -X ${VERSION_PKG}.Commit=${COMMIT} -X ${VERSION_PKG}.BuildTime=${BUILD_TIME}"
 
 # Default target
 .PHONY: all
@@ -74,7 +76,7 @@ build-upx:
 .PHONY: release
 release:
 	@echo "Building release ${BINARY_NAME}..."
-	@go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME} ./cmd/orris-client
+	@go build -ldflags "-s -w -X ${VERSION_PKG}.Version=${VERSION} -X ${VERSION_PKG}.Commit=${COMMIT} -X ${VERSION_PKG}.BuildTime=${BUILD_TIME}" -o bin/${BINARY_NAME} ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx ${UPX_FLAGS} bin/${BINARY_NAME}
 	@echo "Release build complete: bin/${BINARY_NAME}"
@@ -97,7 +99,7 @@ build-linux-arm64:
 .PHONY: build-linux-upx
 build-linux-upx:
 	@echo "Building ${BINARY_NAME} for Linux amd64 with UPX..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-client
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X ${VERSION_PKG}.Version=${VERSION} -X ${VERSION_PKG}.Commit=${COMMIT} -X ${VERSION_PKG}.BuildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx --best --lzma bin/${BINARY_NAME}-linux-amd64
 	@echo "Build complete: bin/${BINARY_NAME}-linux-amd64 (compressed)"
@@ -106,7 +108,7 @@ build-linux-upx:
 .PHONY: build-linux-arm64-upx
 build-linux-arm64-upx:
 	@echo "Building ${BINARY_NAME} for Linux arm64 with UPX..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-client
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X ${VERSION_PKG}.Version=${VERSION} -X ${VERSION_PKG}.Commit=${COMMIT} -X ${VERSION_PKG}.BuildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx --best --lzma bin/${BINARY_NAME}-linux-arm64
 	@echo "Build complete: bin/${BINARY_NAME}-linux-arm64 (compressed)"
