@@ -442,9 +442,11 @@ func parseCommandData(data any) *forward.CommandData {
 func (a *Agent) handleReloadConfigCommand(conn *forward.HubConn, cmd *forward.CommandData) {
 	logger.Info("reloading config", "command_id", cmd.CommandID)
 	// Trigger a config resync by sending an event
-	conn.SendEvent(forward.EventTypeConfigChange, "config reload requested", map[string]any{
+	if err := conn.SendEvent(forward.EventTypeConfigChange, "config reload requested", map[string]any{
 		"command_id": cmd.CommandID,
-	})
+	}); err != nil {
+		logger.Warn("failed to send config reload event", "error", err)
+	}
 }
 
 // handleRestartRuleCommand handles restart_rule command.
@@ -521,10 +523,12 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 	payload, err := updater.ParsePayload(cmd.Payload)
 	if err != nil {
 		logger.Error("failed to parse update payload", "error", err)
-		conn.SendEvent(forward.EventTypeError, "update failed: invalid payload", map[string]any{
+		if err := conn.SendEvent(forward.EventTypeError, "update failed: invalid payload", map[string]any{
 			"command_id": cmd.CommandID,
 			"error":      err.Error(),
-		})
+		}); err != nil {
+			logger.Warn("failed to send update error event", "error", err)
+		}
 		return
 	}
 
@@ -533,7 +537,8 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 		needsRestart, err := updater.Update(payload)
 		if err != nil {
 			logger.Error("update failed", "error", err)
-			conn.SendEvent(forward.EventTypeError, "update failed", map[string]any{
+			// Try to send error event, but connection may be closed
+			a.sendUpdateEvent(forward.EventTypeError, "update failed", map[string]any{
 				"command_id": cmd.CommandID,
 				"error":      err.Error(),
 			})
@@ -542,7 +547,7 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 
 		if needsRestart {
 			logger.Info("update successful, restarting agent")
-			conn.SendEvent(forward.EventTypeConfigChange, "update successful, restarting", map[string]any{
+			a.sendUpdateEvent(forward.EventTypeConfigChange, "update successful, restarting", map[string]any{
 				"command_id":  cmd.CommandID,
 				"old_version": version.Version,
 				"new_version": payload.Version,
@@ -555,4 +560,21 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 			os.Exit(0)
 		}
 	}()
+}
+
+// sendUpdateEvent sends an update-related event via the current hub connection.
+// It safely handles the case where the connection may have been closed or reconnected.
+func (a *Agent) sendUpdateEvent(eventType, message string, extra map[string]any) {
+	a.hubConnMu.RLock()
+	conn := a.hubConn
+	a.hubConnMu.RUnlock()
+
+	if conn == nil {
+		logger.Warn("cannot send update event: hub not connected", "event_type", eventType)
+		return
+	}
+
+	if err := conn.SendEvent(eventType, message, extra); err != nil {
+		logger.Warn("failed to send update event", "event_type", eventType, "error", err)
+	}
 }
