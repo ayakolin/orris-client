@@ -132,6 +132,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=${INSTALL_DIR}
 
 # Resource limits
 LimitNOFILE=65535

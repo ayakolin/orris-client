@@ -2,10 +2,13 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
+	"github.com/orris-inc/orris-client/internal/updater"
+	"github.com/orris-inc/orris-client/internal/version"
 )
 
 // hubLoop manages the Hub WebSocket connection with automatic reconnection.
@@ -85,8 +88,27 @@ func (a *Agent) runHubOnce(reconnectCfg *forward.ReconnectConfig) error {
 	a.hubConn = conn
 	a.hubConnMu.Unlock()
 
+	// Set up message handler for command messages
+	// Note: Events channel handles config_sync and probe_task, SetMessageHandler handles command
+	conn.SetMessageHandler(func(msg *forward.HubMessage) {
+		if msg.Type == forward.MsgTypeCommand {
+			a.handleCommand(conn, msg.Data)
+		}
+	})
+
 	if reconnectCfg.OnConnected != nil {
 		reconnectCfg.OnConnected()
+	}
+
+	// Report agent version on connect
+	if err := conn.SendEvent(forward.EventTypeConnected, "agent connected", map[string]any{
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"build_time": version.BuildTime,
+		"platform":   version.Platform(),
+		"arch":       version.Arch(),
+	}); err != nil {
+		logger.Warn("failed to send connected event", "error", err)
 	}
 
 	// Start connection read/write pumps in background
@@ -368,4 +390,169 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		ChainPosition:          data.ChainPosition,
 		IsLastInChain:          data.IsLastInChain,
 	}
+}
+
+// handleCommand processes command messages from hub.
+func (a *Agent) handleCommand(conn *forward.HubConn, data any) {
+	cmd := parseCommandData(data)
+	if cmd == nil {
+		logger.Warn("failed to parse command data")
+		return
+	}
+
+	logger.Info("received command", "command_id", cmd.CommandID, "action", cmd.Action)
+
+	switch cmd.Action {
+	case forward.CmdActionReloadConfig:
+		a.handleReloadConfigCommand(conn, cmd)
+	case forward.CmdActionRestartRule:
+		a.handleRestartRuleCommand(conn, cmd)
+	case forward.CmdActionStopRule:
+		a.handleStopRuleCommand(conn, cmd)
+	case forward.CmdActionProbe:
+		a.handleProbeCommand(conn, cmd)
+	case forward.CmdActionUpdate:
+		a.handleUpdateCommand(conn, cmd)
+	default:
+		logger.Warn("unknown command action", "action", cmd.Action)
+	}
+}
+
+// parseCommandData parses CommandData from message data.
+func parseCommandData(data any) *forward.CommandData {
+	dataMap, ok := data.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	cmd := &forward.CommandData{}
+	if v, ok := dataMap["command_id"].(string); ok {
+		cmd.CommandID = v
+	}
+	if v, ok := dataMap["action"].(string); ok {
+		cmd.Action = v
+	}
+	if v, ok := dataMap["payload"]; ok {
+		cmd.Payload = v
+	}
+	return cmd
+}
+
+// handleReloadConfigCommand handles reload_config command.
+func (a *Agent) handleReloadConfigCommand(conn *forward.HubConn, cmd *forward.CommandData) {
+	logger.Info("reloading config", "command_id", cmd.CommandID)
+	// Trigger a config resync by sending an event
+	conn.SendEvent(forward.EventTypeConfigChange, "config reload requested", map[string]any{
+		"command_id": cmd.CommandID,
+	})
+}
+
+// handleRestartRuleCommand handles restart_rule command.
+func (a *Agent) handleRestartRuleCommand(_ *forward.HubConn, cmd *forward.CommandData) {
+	payload, ok := cmd.Payload.(map[string]any)
+	if !ok {
+		logger.Warn("invalid restart_rule payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	ruleID, ok := payload["rule_id"].(string)
+	if !ok {
+		logger.Warn("missing rule_id in restart_rule payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	logger.Info("restarting rule", "command_id", cmd.CommandID, "rule_id", ruleID)
+
+	// Stop and restart the forwarder
+	a.stopForwarder(ruleID, false)
+
+	// Get the rule from the rules list (copy to avoid data race)
+	a.rulesMu.RLock()
+	var ruleCopy forward.Rule
+	var found bool
+	for i := range a.rules {
+		if a.rules[i].ID == ruleID {
+			ruleCopy = a.rules[i]
+			found = true
+			break
+		}
+	}
+	a.rulesMu.RUnlock()
+
+	if found {
+		if err := a.startForwarder(&ruleCopy); err != nil {
+			logger.Error("failed to restart rule", "rule_id", ruleID, "error", err)
+		}
+	} else {
+		logger.Warn("rule not found for restart", "rule_id", ruleID)
+	}
+}
+
+// handleStopRuleCommand handles stop_rule command.
+func (a *Agent) handleStopRuleCommand(_ *forward.HubConn, cmd *forward.CommandData) {
+	payload, ok := cmd.Payload.(map[string]any)
+	if !ok {
+		logger.Warn("invalid stop_rule payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	ruleID, ok := payload["rule_id"].(string)
+	if !ok {
+		logger.Warn("missing rule_id in stop_rule payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	logger.Info("stopping rule", "command_id", cmd.CommandID, "rule_id", ruleID)
+	a.stopForwarder(ruleID, true)
+}
+
+// handleProbeCommand handles probe command.
+func (a *Agent) handleProbeCommand(_ *forward.HubConn, cmd *forward.CommandData) {
+	logger.Debug("probe command received via command channel", "command_id", cmd.CommandID)
+	// Probe tasks are typically handled via the probe_task message type,
+	// but this command can be used for on-demand probes if needed.
+}
+
+// handleUpdateCommand handles update command.
+func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandData) {
+	logger.Info("update command received", "command_id", cmd.CommandID)
+
+	// Parse update payload
+	payload, err := updater.ParsePayload(cmd.Payload)
+	if err != nil {
+		logger.Error("failed to parse update payload", "error", err)
+		conn.SendEvent(forward.EventTypeError, "update failed: invalid payload", map[string]any{
+			"command_id": cmd.CommandID,
+			"error":      err.Error(),
+		})
+		return
+	}
+
+	// Perform update in background
+	go func() {
+		needsRestart, err := updater.Update(payload)
+		if err != nil {
+			logger.Error("update failed", "error", err)
+			conn.SendEvent(forward.EventTypeError, "update failed", map[string]any{
+				"command_id": cmd.CommandID,
+				"error":      err.Error(),
+			})
+			return
+		}
+
+		if needsRestart {
+			logger.Info("update successful, restarting agent")
+			conn.SendEvent(forward.EventTypeConfigChange, "update successful, restarting", map[string]any{
+				"command_id":  cmd.CommandID,
+				"old_version": version.Version,
+				"new_version": payload.Version,
+			})
+
+			// Give time for event to be sent
+			time.Sleep(500 * time.Millisecond)
+
+			// Exit to let systemd/supervisor restart the process
+			os.Exit(0)
+		}
+	}()
 }
