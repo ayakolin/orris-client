@@ -28,7 +28,9 @@ func (a *Agent) trafficLoop() {
 func (a *Agent) statusLoop() {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(a.cfg.StatusInterval)
+	// Start with WebSocket interval, adjust dynamically based on connection mode
+	currentInterval := a.cfg.StatusInterval
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
 	for {
@@ -36,16 +38,31 @@ func (a *Agent) statusLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			a.reportStatus()
+			usedWs := a.reportStatus()
+
+			// Adjust interval based on current mode
+			var targetInterval time.Duration
+			if usedWs {
+				targetInterval = a.cfg.StatusInterval
+			} else {
+				targetInterval = a.cfg.StatusIntervalRest
+			}
+
+			if targetInterval != currentInterval {
+				currentInterval = targetInterval
+				ticker.Reset(currentInterval)
+				logger.Debug("status interval adjusted", "interval", currentInterval)
+			}
 		}
 	}
 }
 
-func (a *Agent) reportStatus() {
+// reportStatus collects and reports agent status. Returns true if WebSocket was used.
+func (a *Agent) reportStatus() bool {
 	st, err := a.collector.Collect(a.ctx)
 	if err != nil {
 		logger.Error("collect status failed", "error", err)
-		return
+		return false
 	}
 
 	// Set active rules and connections
@@ -92,20 +109,21 @@ func (a *Agent) reportStatus() {
 				"rules", st.ActiveRules)
 			// Report rule sync status via WebSocket
 			a.reportRuleSyncStatus()
-			return
+			return true
 		}
 	}
 
 	// Fallback to HTTP POST when WebSocket is not available or failed
 	if err := a.client.ReportStatus(a.ctx, st); err != nil {
 		logger.Error("report status via HTTP failed", "error", err)
-		return
+		return false
 	}
 
 	logger.Debug("status reported via HTTP",
 		"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
 		"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
 		"rules", st.ActiveRules)
+	return false
 }
 
 func (a *Agent) reportTraffic() {

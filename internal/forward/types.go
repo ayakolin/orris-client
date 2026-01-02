@@ -181,14 +181,102 @@ type AgentStatus struct {
 	MemoryPercent float64 `json:"memory_percent"`
 	MemoryUsed    uint64  `json:"memory_used"`
 	MemoryTotal   uint64  `json:"memory_total"`
+	MemoryAvail   uint64  `json:"memory_avail"`
 	DiskPercent   float64 `json:"disk_percent"`
 	DiskUsed      uint64  `json:"disk_used"`
 	DiskTotal     uint64  `json:"disk_total"`
 	UptimeSeconds int64   `json:"uptime_seconds"`
 
+	// System load average
+	LoadAvg1  float64 `json:"load_avg_1"`
+	LoadAvg5  float64 `json:"load_avg_5"`
+	LoadAvg15 float64 `json:"load_avg_15"`
+
+	// Network statistics
+	NetworkRxBytes uint64 `json:"network_rx_bytes"` // Total received bytes
+	NetworkTxBytes uint64 `json:"network_tx_bytes"` // Total transmitted bytes
+	NetworkRxRate  uint64 `json:"network_rx_rate"`  // Current receive rate (bytes/sec)
+	NetworkTxRate  uint64 `json:"network_tx_rate"`  // Current transmit rate (bytes/sec)
+
 	// Network connections
 	TCPConnections int `json:"tcp_connections"`
 	UDPConnections int `json:"udp_connections"`
+
+	// Public IP addresses
+	PublicIPv4 string `json:"public_ipv4,omitempty"`
+	PublicIPv6 string `json:"public_ipv6,omitempty"`
+
+	// Agent info
+	AgentVersion string `json:"agent_version,omitempty"` // Agent software version (e.g., "1.2.3")
+	Platform     string `json:"platform,omitempty"`      // OS platform (linux, darwin, windows)
+	Arch         string `json:"arch,omitempty"`          // CPU architecture (amd64, arm64, arm, 386)
+
+	// CPU details
+	CPUCores     int     `json:"cpu_cores"`      // Number of CPU cores
+	CPUModelName string  `json:"cpu_model_name"` // CPU model name
+	CPUMHz       float64 `json:"cpu_mhz"`        // CPU frequency in MHz
+
+	// Swap memory
+	SwapTotal   uint64  `json:"swap_total"`   // Total swap in bytes
+	SwapUsed    uint64  `json:"swap_used"`    // Used swap in bytes
+	SwapPercent float64 `json:"swap_percent"` // Swap usage percentage
+
+	// Disk I/O
+	DiskReadBytes  uint64 `json:"disk_read_bytes"`  // Total disk read bytes
+	DiskWriteBytes uint64 `json:"disk_write_bytes"` // Total disk write bytes
+	DiskReadRate   uint64 `json:"disk_read_rate"`   // Disk read rate in bytes per second
+	DiskWriteRate  uint64 `json:"disk_write_rate"`  // Disk write rate in bytes per second
+	DiskIOPS       uint64 `json:"disk_iops"`        // Disk IOPS
+
+	// Pressure Stall Information (PSI)
+	PSICPUSome    float64 `json:"psi_cpu_some"`    // CPU pressure (some)
+	PSICPUFull    float64 `json:"psi_cpu_full"`    // CPU pressure (full)
+	PSIMemorySome float64 `json:"psi_memory_some"` // Memory pressure (some)
+	PSIMemoryFull float64 `json:"psi_memory_full"` // Memory pressure (full)
+	PSIIOSome     float64 `json:"psi_io_some"`     // I/O pressure (some)
+	PSIIOFull     float64 `json:"psi_io_full"`     // I/O pressure (full)
+
+	// Network extended stats
+	NetworkRxPackets uint64 `json:"network_rx_packets"` // Received packets
+	NetworkTxPackets uint64 `json:"network_tx_packets"` // Transmitted packets
+	NetworkRxErrors  uint64 `json:"network_rx_errors"`  // Receive errors
+	NetworkTxErrors  uint64 `json:"network_tx_errors"`  // Transmit errors
+	NetworkRxDropped uint64 `json:"network_rx_dropped"` // Receive dropped packets
+	NetworkTxDropped uint64 `json:"network_tx_dropped"` // Transmit dropped packets
+
+	// Socket statistics
+	SocketsUsed      int `json:"sockets_used"`       // Total used sockets
+	SocketsTCPInUse  int `json:"sockets_tcp_in_use"` // TCP sockets in use
+	SocketsUDPInUse  int `json:"sockets_udp_in_use"` // UDP sockets in use
+	SocketsTCPOrphan int `json:"sockets_tcp_orphan"` // TCP orphan connections
+	SocketsTCPTW     int `json:"sockets_tcp_tw"`     // TCP TIME_WAIT connections
+
+	// Process statistics
+	ProcessesTotal   uint64 `json:"processes_total"`   // Total processes
+	ProcessesRunning uint64 `json:"processes_running"` // Running processes
+	ProcessesBlocked uint64 `json:"processes_blocked"` // Blocked processes
+
+	// File descriptors
+	FileNrAllocated uint64 `json:"file_nr_allocated"` // Allocated file descriptors
+	FileNrMax       uint64 `json:"file_nr_max"`       // Maximum file descriptors
+
+	// Context switches and interrupts
+	ContextSwitches uint64 `json:"context_switches"` // Context switches count
+	Interrupts      uint64 `json:"interrupts"`       // Interrupts count
+
+	// Kernel info
+	KernelVersion string `json:"kernel_version"` // Kernel version
+	Hostname      string `json:"hostname"`       // System hostname
+
+	// Virtual memory statistics
+	VMPageIn  uint64 `json:"vm_page_in"`  // Pages paged in
+	VMPageOut uint64 `json:"vm_page_out"` // Pages paged out
+	VMSwapIn  uint64 `json:"vm_swap_in"`  // Swap pages in
+	VMSwapOut uint64 `json:"vm_swap_out"` // Swap pages out
+	VMOOMKill uint64 `json:"vm_oom_kill"` // OOM kill count
+
+	// Entropy pool
+	EntropyAvailable uint64 `json:"entropy_available"` // Available entropy
 
 	// Forward status
 	ActiveRules       int                    `json:"active_rules"`
@@ -200,11 +288,6 @@ type AgentStatus struct {
 	// not configured per-rule (exit rule type has been removed).
 	WsListenPort  uint16 `json:"ws_listen_port,omitempty"`  // WebSocket listen port for tunnel connections
 	TlsListenPort uint16 `json:"tls_listen_port,omitempty"` // TLS listen port for tunnel connections
-
-	// Agent info
-	AgentVersion string `json:"agent_version,omitempty"` // Agent software version (e.g., "1.2.3")
-	Platform     string `json:"platform,omitempty"`      // OS platform (linux, darwin, windows)
-	Arch         string `json:"arch,omitempty"`          // CPU architecture (amd64, arm64, arm, 386)
 }
 
 // TunnelState represents the connection state of a tunnel.

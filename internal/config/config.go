@@ -7,24 +7,26 @@ import (
 )
 
 type Config struct {
-	ServerURL       string
-	Token           string
-	WsListenPort    uint16 // WebSocket listen port for tunnel connections (exit agent)
-	TlsListenPort   uint16 // TLS listen port for tunnel connections (exit agent)
-	SyncInterval    time.Duration
-	TrafficInterval time.Duration
-	StatusInterval  time.Duration
-	HTTPTimeout     time.Duration
+	ServerURL          string
+	Token              string
+	WsListenPort       uint16 // WebSocket listen port for tunnel connections (exit agent)
+	TlsListenPort      uint16 // TLS listen port for tunnel connections (exit agent)
+	SyncInterval       time.Duration
+	TrafficInterval    time.Duration
+	StatusInterval     time.Duration // WebSocket mode status interval
+	StatusIntervalRest time.Duration // REST mode status interval (fallback)
+	HTTPTimeout        time.Duration
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		ServerURL:       "http://localhost:8080",
-		Token:           "",
-		SyncInterval:    30 * time.Second,
-		TrafficInterval: 60 * time.Second,
-		StatusInterval:  30 * time.Second,
-		HTTPTimeout:     10 * time.Second,
+		ServerURL:          "http://localhost:8080",
+		Token:              "",
+		SyncInterval:       30 * time.Second,
+		TrafficInterval:    60 * time.Second,
+		StatusInterval:     1 * time.Second,
+		StatusIntervalRest: 30 * time.Second,
+		HTTPTimeout:        10 * time.Second,
 	}
 }
 
