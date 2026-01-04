@@ -276,6 +276,34 @@ func IsConnectionClosed(err error) bool {
 	return ok
 }
 
+// ErrAPIURLChanged is returned when the server notifies that API URL has changed.
+// The agent should update its configuration and restart with the new URL.
+var ErrAPIURLChanged = &APIURLChangedError{}
+
+// APIURLChangedError represents an API URL change notification.
+type APIURLChangedError struct {
+	NewURL string
+	Reason string
+}
+
+func (e *APIURLChangedError) Error() string {
+	return "API URL changed to " + e.NewURL
+}
+
+// IsAPIURLChanged returns true if the error is an API URL changed error.
+func IsAPIURLChanged(err error) bool {
+	_, ok := err.(*APIURLChangedError)
+	return ok
+}
+
+// GetAPIURLChangedError returns the APIURLChangedError if err is one, nil otherwise.
+func GetAPIURLChangedError(err error) *APIURLChangedError {
+	if e, ok := err.(*APIURLChangedError); ok {
+		return e
+	}
+	return nil
+}
+
 // IsWebSocketCloseError returns true if the error is a WebSocket close error.
 func IsWebSocketCloseError(err error) bool {
 	return websocket.IsCloseError(err,

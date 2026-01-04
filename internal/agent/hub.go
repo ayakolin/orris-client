@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/orris-inc/orris-client/internal/config"
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
 	"github.com/orris-inc/orris-client/internal/updater"
@@ -151,6 +152,11 @@ func (a *Agent) handleHubEvent(conn *forward.HubConn, event *forward.HubEvent) {
 					conn.SendProbeResult(result)
 				}
 			}()
+		}
+
+	case forward.HubEventAPIURLChanged:
+		if event.APIURLChanged != nil {
+			a.handleAPIURLChanged(conn, event.APIURLChanged.NewURL, event.APIURLChanged.Reason)
 		}
 	}
 }
@@ -413,6 +419,8 @@ func (a *Agent) handleCommand(conn *forward.HubConn, data any) {
 		a.handleProbeCommand(conn, cmd)
 	case forward.CmdActionUpdate:
 		a.handleUpdateCommand(conn, cmd)
+	case forward.CmdActionAPIURLChanged:
+		a.handleAPIURLChangedCommand(conn, cmd)
 	default:
 		logger.Warn("unknown command action", "action", cmd.Action)
 	}
@@ -560,6 +568,60 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 			os.Exit(0)
 		}
 	}()
+}
+
+// handleAPIURLChangedCommand handles api_url_changed command from server.
+func (a *Agent) handleAPIURLChangedCommand(conn *forward.HubConn, cmd *forward.CommandData) {
+	payload, ok := cmd.Payload.(map[string]any)
+	if !ok {
+		logger.Warn("invalid api_url_changed payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	newURL, _ := payload["new_url"].(string)
+	reason, _ := payload["reason"].(string)
+
+	if newURL == "" {
+		logger.Warn("missing new_url in api_url_changed payload", "command_id", cmd.CommandID)
+		return
+	}
+
+	a.handleAPIURLChanged(conn, newURL, reason)
+}
+
+// handleAPIURLChanged handles API URL change notification.
+// It validates the new URL, saves it to config file, and exits to let systemd/supervisor restart.
+func (a *Agent) handleAPIURLChanged(_ *forward.HubConn, newURL, reason string) {
+	// Use redacted URL in logs to avoid leaking credentials
+	redactedURL := config.RedactURL(newURL)
+
+	logger.Info("received API URL change notification",
+		"new_url", redactedURL,
+		"reason", reason)
+
+	// Validate URL before accepting
+	if err := config.ValidateServerURL(newURL); err != nil {
+		logger.Error("rejected invalid server URL from server",
+			"new_url", redactedURL,
+			"error", err)
+		return
+	}
+
+	// Save new URL to config file
+	if err := config.SaveServerURL(newURL); err != nil {
+		logger.Error("failed to save new server URL to config", "error", err)
+		// Do not restart if we can't save the config - would cause infinite restart loop
+		return
+	}
+
+	logger.Info("saved new server URL to config", "path", config.ConfigFilePath())
+
+	// Give time for log to be written
+	time.Sleep(100 * time.Millisecond)
+
+	// Exit to let systemd/supervisor restart the process with new URL
+	logger.Info("exiting for restart with new API URL")
+	os.Exit(0)
 }
 
 // sendUpdateEvent sends an update-related event via the current hub connection.
