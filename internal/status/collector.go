@@ -202,6 +202,12 @@ func (c *Collector) collectCPUInfo(status *forward.AgentStatus) {
 		}
 	}
 
+	// For ARM architecture, /proc/cpuinfo doesn't have "cpu MHz" field.
+	// Try to read from sysfs cpufreq instead.
+	if mhz == 0 {
+		mhz = c.getCPUFreqFromSysfs()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -213,6 +219,26 @@ func (c *Collector) collectCPUInfo(status *forward.AgentStatus) {
 	status.CPUCores = c.cpuCores
 	status.CPUModelName = c.cpuModelName
 	status.CPUMHz = c.cpuMHz
+}
+
+// getCPUFreqFromSysfs reads CPU frequency from sysfs (used for ARM and other architectures
+// where /proc/cpuinfo doesn't contain MHz information).
+func (c *Collector) getCPUFreqFromSysfs() float64 {
+	// Try cpuinfo_max_freq first (reports the maximum frequency in kHz)
+	if data, err := os.ReadFile("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"); err == nil {
+		if khz, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			return float64(khz) / 1000.0 // Convert kHz to MHz
+		}
+	}
+
+	// Fallback to scaling_max_freq if cpuinfo_max_freq is not available
+	if data, err := os.ReadFile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"); err == nil {
+		if khz, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			return float64(khz) / 1000.0 // Convert kHz to MHz
+		}
+	}
+
+	return 0
 }
 
 // collectMemory reads memory and swap info from /proc/meminfo.
