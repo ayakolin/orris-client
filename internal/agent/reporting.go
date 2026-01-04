@@ -126,7 +126,11 @@ func (a *Agent) reportStatus() bool {
 	return false
 }
 
+// maxPendingTrafficRules limits pending traffic items to prevent memory bloat.
+const maxPendingTrafficRules = 1000
+
 func (a *Agent) reportTraffic() {
+	// Collect current traffic
 	a.forwardersMu.RLock()
 	items := make([]forward.TrafficItem, 0, len(a.forwarders))
 	for _, f := range a.forwarders {
@@ -140,6 +144,14 @@ func (a *Agent) reportTraffic() {
 		}
 	}
 	a.forwardersMu.RUnlock()
+
+	// Merge with pending traffic from previous failed attempts
+	a.pendingTrafficMu.Lock()
+	if len(a.pendingTraffic) > 0 {
+		items = mergeTrafficItems(a.pendingTraffic, items)
+		a.pendingTraffic = nil
+	}
+	a.pendingTrafficMu.Unlock()
 
 	if len(items) == 0 {
 		return
@@ -151,17 +163,100 @@ func (a *Agent) reportTraffic() {
 		totalDownload += item.DownloadBytes
 	}
 
+	// Try WebSocket first
+	a.hubConnMu.RLock()
+	conn := a.hubConn
+	a.hubConnMu.RUnlock()
+
+	if conn != nil {
+		if err := a.sendTrafficViaWs(conn, items); err != nil {
+			logger.Warn("report traffic via websocket failed, falling back to HTTP", "error", err)
+		} else {
+			logger.Debug("traffic reported via websocket",
+				"rules", len(items),
+				"upload_bytes", totalUpload,
+				"download_bytes", totalDownload)
+			return
+		}
+	}
+
+	// Fallback to HTTP POST
 	if err := a.client.ReportTraffic(a.ctx, items); err != nil {
-		logger.Error("report traffic failed", "error", err)
+		logger.Warn("report traffic via HTTP failed, will retry next interval", "error", err)
+		a.savePendingTraffic(items)
 		return
 	}
-	logger.Info("traffic reported",
+	logger.Debug("traffic reported via HTTP",
 		"rules", len(items),
 		"upload_bytes", totalUpload,
 		"download_bytes", totalDownload)
 }
 
+// savePendingTraffic saves failed traffic items for retry.
+func (a *Agent) savePendingTraffic(items []forward.TrafficItem) {
+	a.pendingTrafficMu.Lock()
+	defer a.pendingTrafficMu.Unlock()
+
+	// Merge with existing pending items
+	a.pendingTraffic = mergeTrafficItems(a.pendingTraffic, items)
+
+	// Limit pending items to prevent memory bloat
+	if len(a.pendingTraffic) > maxPendingTrafficRules {
+		dropped := len(a.pendingTraffic) - maxPendingTrafficRules
+		a.pendingTraffic = a.pendingTraffic[dropped:]
+		logger.Warn("pending traffic exceeded limit, dropped oldest items", "dropped", dropped)
+	}
+}
+
+// mergeTrafficItems merges two traffic item slices, combining items with same RuleID.
+func mergeTrafficItems(existing, new []forward.TrafficItem) []forward.TrafficItem {
+	if len(existing) == 0 {
+		return new
+	}
+	if len(new) == 0 {
+		return existing
+	}
+
+	// Build map from existing items
+	merged := make(map[string]*forward.TrafficItem, len(existing)+len(new))
+	for i := range existing {
+		item := &existing[i]
+		merged[item.RuleID] = item
+	}
+
+	// Merge new items
+	for _, item := range new {
+		if m, ok := merged[item.RuleID]; ok {
+			m.UploadBytes += item.UploadBytes
+			m.DownloadBytes += item.DownloadBytes
+		} else {
+			itemCopy := item
+			merged[item.RuleID] = &itemCopy
+		}
+	}
+
+	// Convert back to slice
+	result := make([]forward.TrafficItem, 0, len(merged))
+	for _, item := range merged {
+		result = append(result, *item)
+	}
+	return result
+}
+
+// sendTrafficViaWs sends traffic data via WebSocket connection.
+func (a *Agent) sendTrafficViaWs(conn *forward.HubConn, items []forward.TrafficItem) error {
+	data := &forward.TrafficEventData{
+		Rules: items,
+	}
+	logger.Debug("sending traffic event via websocket",
+		"event_type", forward.EventTypeTraffic,
+		"rules_count", len(items),
+		"data", data)
+	return conn.SendEvent(forward.EventTypeTraffic, "", data)
+}
+
 func (a *Agent) reportFinalTraffic() {
+	// Collect current traffic
 	a.forwardersMu.RLock()
 	items := make([]forward.TrafficItem, 0, len(a.forwarders))
 	for _, f := range a.forwarders {
@@ -175,6 +270,14 @@ func (a *Agent) reportFinalTraffic() {
 		}
 	}
 	a.forwardersMu.RUnlock()
+
+	// Include pending traffic from previous failed attempts
+	a.pendingTrafficMu.Lock()
+	if len(a.pendingTraffic) > 0 {
+		items = mergeTrafficItems(a.pendingTraffic, items)
+		a.pendingTraffic = nil
+	}
+	a.pendingTrafficMu.Unlock()
 
 	if len(items) == 0 {
 		return
@@ -190,7 +293,10 @@ func (a *Agent) reportFinalTraffic() {
 	defer cancel()
 
 	if err := a.client.ReportTraffic(ctx, items); err != nil {
-		logger.Error("report final traffic failed", "error", err)
+		logger.Error("report final traffic failed", "error", err,
+			"rules", len(items),
+			"upload_bytes", totalUpload,
+			"download_bytes", totalDownload)
 		return
 	}
 	logger.Info("final traffic reported",

@@ -23,7 +23,7 @@ func DefaultConfig() *Config {
 		ServerURL:          "http://localhost:8080",
 		Token:              "",
 		SyncInterval:       30 * time.Second,
-		TrafficInterval:    60 * time.Second,
+		TrafficInterval:    1 * time.Second,
 		StatusInterval:     1 * time.Second,
 		StatusIntervalRest: 30 * time.Second,
 		HTTPTimeout:        10 * time.Second,

@@ -64,6 +64,10 @@ type Agent struct {
 	hubConnMu sync.RWMutex     // protects hubConn access
 	hubConn   *forward.HubConn // current hub WebSocket connection
 
+	// Pending traffic for retry on failure
+	pendingTrafficMu sync.Mutex
+	pendingTraffic   []forward.TrafficItem
+
 	ctx      context.Context
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup

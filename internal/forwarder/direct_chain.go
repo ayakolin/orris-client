@@ -30,8 +30,10 @@ type DirectChainForwarder struct {
 	udpClientsMu sync.RWMutex
 	udpClients   map[string]*udpClient // client addr -> upstream conn
 
-	// Active TCP connections counter
+	// Active TCP connections tracking
 	activeConns atomic.Int32
+	tcpConnsMu  sync.Mutex
+	tcpConns    map[net.Conn]struct{} // active TCP connections for graceful shutdown
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -45,6 +47,7 @@ func NewDirectChainForwarder(rule *forward.Rule) *DirectChainForwarder {
 		traffic:    &TrafficCounter{},
 		cb:         newCircuitBreaker(),
 		udpClients: make(map[string]*udpClient),
+		tcpConns:   make(map[net.Conn]struct{}),
 	}
 }
 
@@ -172,6 +175,14 @@ func (f *DirectChainForwarder) Stop() error {
 		f.udpConn.Close()
 	}
 
+	// Close all active TCP connections to unblock io.Copy
+	f.tcpConnsMu.Lock()
+	for conn := range f.tcpConns {
+		conn.Close()
+	}
+	f.tcpConns = make(map[net.Conn]struct{})
+	f.tcpConnsMu.Unlock()
+
 	// Close all UDP upstream connections
 	f.udpClientsMu.Lock()
 	for _, client := range f.udpClients {
@@ -216,6 +227,16 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	defer f.wg.Done()
 	defer clientConn.Close()
 
+	// Track this connection for graceful shutdown
+	f.tcpConnsMu.Lock()
+	f.tcpConns[clientConn] = struct{}{}
+	f.tcpConnsMu.Unlock()
+	defer func() {
+		f.tcpConnsMu.Lock()
+		delete(f.tcpConns, clientConn)
+		f.tcpConnsMu.Unlock()
+	}()
+
 	f.activeConns.Add(1)
 	defer f.activeConns.Add(-1)
 
@@ -249,6 +270,16 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	// Dial succeeded, record success
 	f.cb.RecordSuccess()
 	defer upstreamConn.Close()
+
+	// Track upstream connection for graceful shutdown
+	f.tcpConnsMu.Lock()
+	f.tcpConns[upstreamConn] = struct{}{}
+	f.tcpConnsMu.Unlock()
+	defer func() {
+		f.tcpConnsMu.Lock()
+		delete(f.tcpConns, upstreamConn)
+		f.tcpConnsMu.Unlock()
+	}()
 
 	logger.Debug("direct chain tcp connection established",
 		"rule_id", f.rule.ID,
