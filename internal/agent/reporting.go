@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
@@ -208,7 +209,15 @@ func (a *Agent) savePendingTraffic(items []forward.TrafficItem) {
 	}
 }
 
+// trafficMergeMapPool reuses maps for traffic merging to reduce GC pressure.
+var trafficMergeMapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]int, 64) // ruleID -> index in result slice
+	},
+}
+
 // mergeTrafficItems merges two traffic item slices, combining items with same RuleID.
+// Uses a pooled map to reduce memory allocations.
 func mergeTrafficItems(existing, new []forward.TrafficItem) []forward.TrafficItem {
 	if len(existing) == 0 {
 		return new
@@ -217,29 +226,35 @@ func mergeTrafficItems(existing, new []forward.TrafficItem) []forward.TrafficIte
 		return existing
 	}
 
-	// Build map from existing items
-	merged := make(map[string]*forward.TrafficItem, len(existing)+len(new))
+	// Get map from pool and clear it
+	indexMap := trafficMergeMapPool.Get().(map[string]int)
+	for k := range indexMap {
+		delete(indexMap, k)
+	}
+	defer trafficMergeMapPool.Put(indexMap)
+
+	// Pre-allocate result slice with capacity for all items
+	result := make([]forward.TrafficItem, 0, len(existing)+len(new))
+
+	// Add existing items and build index map
 	for i := range existing {
-		item := &existing[i]
-		merged[item.RuleID] = item
+		indexMap[existing[i].RuleID] = len(result)
+		result = append(result, existing[i])
 	}
 
 	// Merge new items
-	for _, item := range new {
-		if m, ok := merged[item.RuleID]; ok {
-			m.UploadBytes += item.UploadBytes
-			m.DownloadBytes += item.DownloadBytes
+	for i := range new {
+		if idx, ok := indexMap[new[i].RuleID]; ok {
+			// Merge into existing item
+			result[idx].UploadBytes += new[i].UploadBytes
+			result[idx].DownloadBytes += new[i].DownloadBytes
 		} else {
-			itemCopy := item
-			merged[item.RuleID] = &itemCopy
+			// Add new item
+			indexMap[new[i].RuleID] = len(result)
+			result = append(result, new[i])
 		}
 	}
 
-	// Convert back to slice
-	result := make([]forward.TrafficItem, 0, len(merged))
-	for _, item := range merged {
-		result = append(result, *item)
-	}
 	return result
 }
 
@@ -303,6 +318,36 @@ func (a *Agent) reportFinalTraffic() {
 		"rules", len(items),
 		"upload_bytes", totalUpload,
 		"download_bytes", totalDownload)
+}
+
+// ruleStatusReportDebounceInterval is the minimum time between status reports.
+const ruleStatusReportDebounceInterval = 100 * time.Millisecond
+
+// ruleStatusReportLoop is a debounced loop that reports rule status changes.
+// It coalesces multiple status changes into a single report to reduce overhead.
+func (a *Agent) ruleStatusReportLoop() {
+	defer a.wg.Done()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.ruleStatusReportCh:
+			// Wait briefly to coalesce multiple rapid updates
+			time.Sleep(ruleStatusReportDebounceInterval)
+
+			// Drain any additional signals that arrived during the wait
+			for {
+				select {
+				case <-a.ruleStatusReportCh:
+				default:
+					goto report
+				}
+			}
+		report:
+			a.reportRuleSyncStatus()
+		}
+	}
 }
 
 // reportRuleSyncStatus sends rule sync status to the server via WebSocket.

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -244,6 +245,12 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 		a.clientToken = data.ClientToken
 	}
 
+	// Update blocked protocols from full sync
+	a.blockedProtocols = data.BlockedProtocols
+	if len(data.BlockedProtocols) > 0 {
+		logger.Info("blocked protocols updated", "protocols", data.BlockedProtocols)
+	}
+
 	// Build old rules map for comparison (detect changed rules)
 	oldRules := make(map[string]*forward.Rule)
 	for i := range a.rules {
@@ -267,6 +274,13 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 			f.Stop()
 			delete(a.forwarders, ruleID)
 			a.deleteRuleStatus(ruleID)
+		} else if a.isProtocolBlockedUnsafe(newRule.Protocol) {
+			// Protocol blocked - stop forwarder (no restart)
+			// Lock order: rulesMu (held) -> forwardersMu (held) -> ruleStatusMu (acquired by setRuleStatus)
+			logger.Info("stopping forwarder for blocked protocol", "rule_id", ruleID, "protocol", newRule.Protocol)
+			f.Stop()
+			delete(a.forwarders, ruleID)
+			a.setRuleStatus(ruleID, forward.SyncStatusFailed, forward.RunStatusError, "protocol blocked")
 		} else if oldRule, hadOld := oldRules[ruleID]; hadOld && ruleConfigChanged(oldRule, newRule) {
 			// Rule exists but config changed - need restart
 			logger.Info("stopping forwarder for changed rule", "rule_id", ruleID)
@@ -339,6 +353,11 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 
 // handleIncrementalSync handles incremental configuration sync.
 func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
+	// Update blocked protocols if provided
+	if data.BlockedProtocols != nil {
+		a.updateBlockedProtocols(data.BlockedProtocols)
+	}
+
 	// Handle removed rules (updateStatus=false since we delete status immediately after)
 	for _, ruleID := range data.Removed {
 		a.stopForwarder(ruleID, false)
@@ -523,6 +542,9 @@ func (a *Agent) handleProbeCommand(_ *forward.HubConn, cmd *forward.CommandData)
 	// but this command can be used for on-demand probes if needed.
 }
 
+// updateTimeout is the maximum time allowed for update download and installation.
+const updateTimeout = 10 * time.Minute
+
 // handleUpdateCommand handles update command.
 func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandData) {
 	logger.Info("update command received", "command_id", cmd.CommandID)
@@ -540,32 +562,59 @@ func (a *Agent) handleUpdateCommand(conn *forward.HubConn, cmd *forward.CommandD
 		return
 	}
 
-	// Perform update in background
+	// Perform update in background with timeout
 	go func() {
-		needsRestart, err := updater.Update(payload)
-		if err != nil {
-			logger.Error("update failed", "error", err)
-			// Try to send error event, but connection may be closed
-			a.sendUpdateEvent(forward.EventTypeError, "update failed", map[string]any{
+		// Create timeout context for update operation
+		updateCtx, cancel := context.WithTimeout(context.Background(), updateTimeout)
+		defer cancel()
+
+		// Run update with timeout
+		resultCh := make(chan struct {
+			needsRestart bool
+			err          error
+		}, 1)
+
+		go func() {
+			needsRestart, err := updater.Update(payload)
+			resultCh <- struct {
+				needsRestart bool
+				err          error
+			}{needsRestart, err}
+		}()
+
+		select {
+		case <-updateCtx.Done():
+			logger.Error("update timed out", "timeout", updateTimeout)
+			a.sendUpdateEvent(forward.EventTypeError, "update failed: timeout", map[string]any{
 				"command_id": cmd.CommandID,
-				"error":      err.Error(),
+				"error":      "update operation timed out",
 			})
 			return
-		}
 
-		if needsRestart {
-			logger.Info("update successful, restarting agent")
-			a.sendUpdateEvent(forward.EventTypeConfigChange, "update successful, restarting", map[string]any{
-				"command_id":  cmd.CommandID,
-				"old_version": version.Version,
-				"new_version": payload.Version,
-			})
+		case result := <-resultCh:
+			if result.err != nil {
+				logger.Error("update failed", "error", result.err)
+				a.sendUpdateEvent(forward.EventTypeError, "update failed", map[string]any{
+					"command_id": cmd.CommandID,
+					"error":      result.err.Error(),
+				})
+				return
+			}
 
-			// Give time for event to be sent
-			time.Sleep(500 * time.Millisecond)
+			if result.needsRestart {
+				logger.Info("update successful, restarting agent")
+				a.sendUpdateEvent(forward.EventTypeConfigChange, "update successful, restarting", map[string]any{
+					"command_id":  cmd.CommandID,
+					"old_version": version.Version,
+					"new_version": payload.Version,
+				})
 
-			// Exit to let systemd/supervisor restart the process
-			os.Exit(0)
+				// Give time for event to be sent
+				time.Sleep(500 * time.Millisecond)
+
+				// Exit to let systemd/supervisor restart the process
+				os.Exit(0)
+			}
 		}
 	}()
 }

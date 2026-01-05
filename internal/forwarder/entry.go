@@ -15,6 +15,12 @@ import (
 	"github.com/orris-inc/orris-client/internal/tunnel"
 )
 
+// udpClientEntry tracks UDP client state for cleanup.
+type udpClientEntry struct {
+	connID         uint64
+	lastActiveNano atomic.Int64 // Unix nanoseconds, safe for concurrent access
+}
+
 // EntryForwarder handles entry forwarding (local port -> WS tunnel -> exit agent).
 type EntryForwarder struct {
 	rule        *forward.Rule
@@ -29,10 +35,10 @@ type EntryForwarder struct {
 	// Circuit breaker to prevent connection storms when tunnel is unavailable
 	cb *circuitBreaker
 
-	// UDP client tracking: clientAddr -> connID mapping
+	// UDP client tracking: clientAddr -> client state mapping
 	udpClientsMu sync.RWMutex
-	udpClients   map[string]uint64       // clientAddr -> connID
-	udpConnIDs   map[uint64]*net.UDPAddr // connID -> clientAddr (for response routing)
+	udpClients   map[string]*udpClientEntry // clientAddr -> client state
+	udpConnIDs   map[uint64]*net.UDPAddr    // connID -> clientAddr (for response routing)
 
 	nextConnID atomic.Uint64
 	ctx        context.Context
@@ -48,7 +54,7 @@ func NewEntryForwarder(rule *forward.Rule, t tunnel.Sender) *EntryForwarder {
 		traffic:    &TrafficCounter{},
 		cb:         newCircuitBreaker(),
 		conns:      make(map[uint64]*connState),
-		udpClients: make(map[string]uint64),
+		udpClients: make(map[string]*udpClientEntry),
 		udpConnIDs: make(map[uint64]*net.UDPAddr),
 	}
 }
@@ -121,8 +127,9 @@ func (f *EntryForwarder) startUDP() error {
 	}
 	f.udpConn = conn
 
-	f.wg.Add(1)
+	f.wg.Add(2)
 	go f.udpReadLoop()
+	go f.udpCleanupLoop()
 
 	return nil
 }
@@ -149,7 +156,7 @@ func (f *EntryForwarder) Stop() error {
 
 	// Clear UDP client mappings
 	f.udpClientsMu.Lock()
-	f.udpClients = make(map[string]uint64)
+	f.udpClients = make(map[string]*udpClientEntry)
 	f.udpConnIDs = make(map[uint64]*net.UDPAddr)
 	f.udpClientsMu.Unlock()
 
@@ -244,6 +251,16 @@ func (f *EntryForwarder) handleUDPData(connID uint64, data []byte) {
 		logger.Debug("entry udp unknown connID", "conn_id", connID)
 		return
 	}
+
+	// Update last active time for the client
+	f.udpClientsMu.RLock()
+	for _, client := range f.udpClients {
+		if client.connID == connID {
+			client.lastActiveNano.Store(time.Now().UnixNano())
+			break
+		}
+	}
+	f.udpClientsMu.RUnlock()
 
 	n, err := f.udpConn.WriteToUDP(data, clientAddr)
 	if err != nil {
@@ -388,25 +405,30 @@ func (f *EntryForwarder) getOrCreateUDPConnID(clientAddr *net.UDPAddr) uint64 {
 
 	// Fast path: check with read lock
 	f.udpClientsMu.RLock()
-	connID, exists := f.udpClients[key]
+	client, exists := f.udpClients[key]
 	f.udpClientsMu.RUnlock()
 
 	if exists {
-		return connID
+		// Update last active time
+		client.lastActiveNano.Store(time.Now().UnixNano())
+		return client.connID
 	}
 
 	// Slow path: create with write lock
 	f.udpClientsMu.Lock()
 
 	// Double-check: another goroutine may have created it
-	if connID, exists = f.udpClients[key]; exists {
+	if client, exists = f.udpClients[key]; exists {
 		f.udpClientsMu.Unlock()
-		return connID
+		client.lastActiveNano.Store(time.Now().UnixNano())
+		return client.connID
 	}
 
 	// Create new connID while holding the lock
-	connID = f.nextConnID.Add(1)
-	f.udpClients[key] = connID
+	connID := f.nextConnID.Add(1)
+	client = &udpClientEntry{connID: connID}
+	client.lastActiveNano.Store(time.Now().UnixNano())
+	f.udpClients[key] = client
 	f.udpConnIDs[connID] = clientAddr
 	f.udpClientsMu.Unlock()
 
@@ -425,9 +447,67 @@ func (f *EntryForwarder) closeUDPConn(connID uint64) {
 	defer f.udpClientsMu.Unlock()
 
 	if clientAddr, ok := f.udpConnIDs[connID]; ok {
-		delete(f.udpClients, clientAddr.String())
+		key := clientAddr.String()
+		delete(f.udpClients, key)
 		delete(f.udpConnIDs, connID)
+		logger.Debug("entry udp client removed", "conn_id", connID, "client", key)
 	}
+}
+
+// udpCleanupLoop periodically cleans up idle UDP clients.
+func (f *EntryForwarder) udpCleanupLoop() {
+	defer f.wg.Done()
+
+	ticker := time.NewTicker(udpCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-f.ctx.Done():
+			return
+		case <-ticker.C:
+			f.cleanupIdleUDPClients()
+		}
+	}
+}
+
+// cleanupIdleUDPClients removes idle UDP clients.
+func (f *EntryForwarder) cleanupIdleUDPClients() {
+	now := time.Now()
+	var toRemove []string
+
+	f.udpClientsMu.RLock()
+	for key, client := range f.udpClients {
+		lastActiveNano := client.lastActiveNano.Load()
+		lastActive := time.Unix(0, lastActiveNano)
+		if now.Sub(lastActive) > udpIdleTimeout {
+			toRemove = append(toRemove, key)
+		}
+	}
+	f.udpClientsMu.RUnlock()
+
+	if len(toRemove) == 0 {
+		return
+	}
+
+	f.udpClientsMu.Lock()
+	for _, key := range toRemove {
+		if client, ok := f.udpClients[key]; ok {
+			// Double-check: client may have been active since we released the lock
+			lastActiveNano := client.lastActiveNano.Load()
+			lastActive := time.Unix(0, lastActiveNano)
+			if now.Sub(lastActive) > udpIdleTimeout {
+				connID := client.connID
+				delete(f.udpClients, key)
+				delete(f.udpConnIDs, connID)
+				logger.Debug("entry removing idle udp client", "conn_id", connID, "client", key)
+
+				// Send close message to tunnel (outside of lock would be better, but acceptable)
+				f.tunnel.SendMessage(tunnel.NewCloseMessage(tunnel.MakeUDPConnID(connID)))
+			}
+		}
+	}
+	f.udpClientsMu.Unlock()
 }
 
 // ListenPort returns the actual listening port from the listener or UDP connection.

@@ -11,7 +11,7 @@ import (
 )
 
 // setRuleStatus updates the sync and runtime status of a rule.
-// It also triggers an immediate status report via WebSocket.
+// It signals the debounce goroutine to report status (coalesces multiple updates).
 func (a *Agent) setRuleStatus(ruleID, syncStatus, runStatus, errMsg string) {
 	a.ruleStatusMu.Lock()
 	if a.ruleStatus[ruleID] == nil {
@@ -25,8 +25,12 @@ func (a *Agent) setRuleStatus(ruleID, syncStatus, runStatus, errMsg string) {
 	}
 	a.ruleStatusMu.Unlock()
 
-	// Trigger immediate status report (async to avoid blocking)
-	go a.reportRuleSyncStatus()
+	// Signal debounce goroutine (non-blocking)
+	select {
+	case a.ruleStatusReportCh <- struct{}{}:
+	default:
+		// Channel already has a pending signal, skip
+	}
 }
 
 // deleteRuleStatus removes the status entry for a rule.
@@ -133,13 +137,17 @@ func (a *Agent) syncRules() error {
 		}
 	}
 
-	// Start forwarders for new rules
-	for _, rule := range rules {
-		a.forwardersMu.RLock()
-		_, exists := a.forwarders[rule.ID]
-		a.forwardersMu.RUnlock()
+	// Collect existing forwarder IDs once to avoid repeated lock acquisition
+	a.forwardersMu.RLock()
+	existingIDs := make(map[string]struct{}, len(a.forwarders))
+	for id := range a.forwarders {
+		existingIDs[id] = struct{}{}
+	}
+	a.forwardersMu.RUnlock()
 
-		if !exists {
+	// Start forwarders for new rules (no lock needed for existingIDs check)
+	for _, rule := range rules {
+		if _, exists := existingIDs[rule.ID]; !exists {
 			r := rule
 			if err := a.startForwarder(&r); err != nil {
 				logger.Error("start forwarder failed", "rule_id", rule.ID, "error", err)
@@ -151,6 +159,14 @@ func (a *Agent) syncRules() error {
 }
 
 func (a *Agent) startForwarder(rule *forward.Rule) error {
+	// Check if protocol is blocked at agent level
+	if a.isProtocolBlocked(rule.Protocol) {
+		err := fmt.Errorf("protocol %q is blocked", rule.Protocol)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		logger.Warn("skipping forwarder for blocked protocol", "rule_id", rule.ID, "protocol", rule.Protocol)
+		return err
+	}
+
 	// Set initial status: pending sync, starting run
 	a.setRuleStatus(rule.ID, forward.SyncStatusPending, forward.RunStatusStarting, "")
 
