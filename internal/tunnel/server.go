@@ -111,6 +111,7 @@ func (s *Server) Start(ctx context.Context) error {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"}, // Disable HTTP/2, WebSocket requires HTTP/1.1
 	}
 
 	// Create TCP listener first to get the actual port (supports port 0 for random)
