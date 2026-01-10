@@ -117,6 +117,28 @@ func (f *ExitForwarder) RuleID() string {
 	return f.rule.ID
 }
 
+// OnTunnelDisconnect is called when the tunnel connection is closed.
+// It closes all active connections to stop readFromTarget and udpUpstreamReadLoop goroutines.
+func (f *ExitForwarder) OnTunnelDisconnect() {
+	// Close all TCP connections to unblock Read() in readFromTarget
+	f.connMu.Lock()
+	for _, cs := range f.conns {
+		cs.Close()
+	}
+	f.connMu.Unlock()
+
+	// Close all UDP connections to unblock Read() in udpUpstreamReadLoop
+	f.udpConnsMu.Lock()
+	for _, client := range f.udpConns {
+		if client.upstream != nil {
+			client.upstream.Close()
+		}
+	}
+	f.udpConnsMu.Unlock()
+
+	logger.Debug("exit forwarder tunnel disconnected, closed all connections", "rule_id", f.rule.ID)
+}
+
 // HandleConnect handles TCP connect message from tunnel.
 func (f *ExitForwarder) HandleConnect(connID uint64) {
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))

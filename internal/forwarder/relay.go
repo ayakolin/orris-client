@@ -99,6 +99,16 @@ func (f *RelayForwarder) RuleID() string {
 	return f.rule.ID
 }
 
+// OnTunnelDisconnect is called when the inbound tunnel connection is closed.
+// RelayForwarder doesn't hold target connections, so just clear the closed map.
+func (f *RelayForwarder) OnTunnelDisconnect() {
+	f.closedMu.Lock()
+	f.closed = make(map[uint64]*closedEntry)
+	f.closedMu.Unlock()
+
+	logger.Debug("relay forwarder tunnel disconnected", "rule_id", f.rule.ID)
+}
+
 // HandleConnect handles connect message from inbound (previous hop -> relay -> next hop).
 // Implements tunnel.MessageHandler for tunnel.Server.
 func (f *RelayForwarder) HandleConnect(connID uint64) {

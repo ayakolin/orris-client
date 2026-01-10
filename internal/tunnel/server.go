@@ -23,6 +23,9 @@ type MessageHandler interface {
 	HandleConnectWithPayload(connID uint64, payload []byte) // For UDP connections with client address
 	HandleData(connID uint64, data []byte)
 	HandleClose(connID uint64)
+	// OnTunnelDisconnect is called when the tunnel connection is closed.
+	// Implementations should close all active connections to stop goroutines.
+	OnTunnelDisconnect()
 }
 
 // Sender sends messages through the tunnel.
@@ -237,6 +240,10 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	logger.Info("entry agent connected", "remote", r.RemoteAddr, "rule_id", ruleID)
 
 	defer func() {
+		// Notify handler that tunnel is disconnected before closing connection.
+		// This allows handler to close all active target connections and stop goroutines.
+		handler.OnTunnelDisconnect()
+
 		s.connMu.Lock()
 		delete(s.conns, conn)
 		delete(s.connLock, conn)

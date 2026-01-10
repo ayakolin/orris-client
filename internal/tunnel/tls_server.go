@@ -236,6 +236,10 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	logger.Info("entry agent connected via tls", "remote", remoteAddr, "rule_id", ruleID)
 
 	defer func() {
+		// Notify handler that tunnel is disconnected before closing connection.
+		// This allows handler to close all active target connections and stop goroutines.
+		handler.OnTunnelDisconnect()
+
 		s.connMu.Lock()
 		delete(s.conns, conn)
 		delete(s.connLock, conn)

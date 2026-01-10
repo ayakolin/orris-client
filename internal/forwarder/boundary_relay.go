@@ -124,6 +124,28 @@ func (f *BoundaryRelayForwarder) RuleID() string {
 	return f.rule.ID
 }
 
+// OnTunnelDisconnect is called when the tunnel connection is closed.
+// It closes all active connections to stop readFromNextHop and udpUpstreamReadLoop goroutines.
+func (f *BoundaryRelayForwarder) OnTunnelDisconnect() {
+	// Close all TCP connections to unblock Read() in readFromNextHop
+	f.connMu.Lock()
+	for _, cs := range f.conns {
+		cs.Close()
+	}
+	f.connMu.Unlock()
+
+	// Close all UDP connections to unblock Read() in udpUpstreamReadLoop
+	f.udpConnsMu.Lock()
+	for _, client := range f.udpConns {
+		if client.upstream != nil {
+			client.upstream.Close()
+		}
+	}
+	f.udpConnsMu.Unlock()
+
+	logger.Debug("boundary relay forwarder tunnel disconnected, closed all connections", "rule_id", f.rule.ID)
+}
+
 // HandleConnect handles TCP connect message from tunnel.
 func (f *BoundaryRelayForwarder) HandleConnect(connID uint64) {
 	nextHopAddr := net.JoinHostPort(f.rule.NextHopAddress, fmt.Sprintf("%d", f.rule.NextHopPort))
