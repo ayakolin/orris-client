@@ -362,8 +362,9 @@ const (
 // TunnelHandshake is sent by entry agent to exit agent when establishing a tunnel connection.
 // The exit agent should verify the token and check if the rule allows this connection.
 type TunnelHandshake struct {
-	AgentToken string `json:"agent_token"` // Entry agent's HMAC-based token for verification
-	RuleID     string `json:"rule_id"`     // The rule this connection belongs to (e.g., "fr_xK9mP2vL3nQ")
+	AgentToken string `json:"agent_token"`          // Entry agent's HMAC-based token for verification
+	RuleID     string `json:"rule_id"`              // The rule this connection belongs to (e.g., "fr_xK9mP2vL3nQ")
+	IsProbe    bool   `json:"is_probe,omitempty"`   // True if this is a probe connection (tunnel ping)
 }
 
 // TunnelHandshakeResult is sent by exit agent back to entry agent after verification.

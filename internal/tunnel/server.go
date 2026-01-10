@@ -193,7 +193,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	writeMu := &sync.Mutex{}
 
 	// Perform handshake
-	ruleID, err := s.performHandshake(conn, writeMu)
+	ruleID, isProbe, err := s.performHandshake(conn, writeMu)
 	if err != nil {
 		logger.Error("tunnel handshake failed", "remote", r.RemoteAddr, "error", err)
 		conn.Close()
@@ -202,6 +202,17 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// Create sender
 	sender := &connSender{conn: conn, mu: writeMu}
+
+	// Handle probe connections separately - only respond to ping/pong, don't affect forwarder
+	if isProbe {
+		logger.Info("probe connection established", "remote", r.RemoteAddr, "rule_id", ruleID)
+		defer func() {
+			conn.Close()
+			logger.Info("probe connection closed", "remote", r.RemoteAddr, "rule_id", ruleID)
+		}()
+		s.probeReadLoop(conn, sender)
+		return
+	}
 
 	// Get handler for this rule, with retry for startup race condition
 	// Handler may not be registered yet if forwarder is still connecting to next hop
@@ -256,7 +267,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	s.readLoop(conn, sender, handler)
 }
 
-func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (string, error) {
+func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, err error) {
 	// Set read deadline for handshake
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -264,12 +275,12 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (st
 	// Read handshake message
 	_, data, err := conn.ReadMessage()
 	if err != nil {
-		return "", fmt.Errorf("read handshake: %w", err)
+		return "", false, fmt.Errorf("read handshake: %w", err)
 	}
 
 	var handshake forward.TunnelHandshake
 	if err := json.Unmarshal(data, &handshake); err != nil {
-		return "", fmt.Errorf("unmarshal handshake: %w", err)
+		return "", false, fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
 	// Log received token info for debugging
@@ -277,7 +288,7 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (st
 	if len(tokenDbg) > 15 {
 		tokenDbg = tokenDbg[:15] + "..."
 	}
-	logger.Debug("received tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg)
+	logger.Debug("received tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe)
 
 	// Verify handshake via server API with timeout
 	logger.Debug("verifying handshake via server API", "rule_id", handshake.RuleID)
@@ -295,23 +306,23 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (st
 		writeMu.Lock()
 		conn.WriteMessage(websocket.TextMessage, resultData)
 		writeMu.Unlock()
-		return "", fmt.Errorf("verify handshake via server: %w", err)
+		return "", false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
 	// Send success result
 	resultData, err := json.Marshal(result)
 	if err != nil {
-		return "", fmt.Errorf("marshal result: %w", err)
+		return "", false, fmt.Errorf("marshal result: %w", err)
 	}
 	writeMu.Lock()
 	err = conn.WriteMessage(websocket.TextMessage, resultData)
 	writeMu.Unlock()
 	if err != nil {
-		return "", fmt.Errorf("send result: %w", err)
+		return "", false, fmt.Errorf("send result: %w", err)
 	}
 
-	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID)
-	return handshake.RuleID, nil
+	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe)
+	return handshake.RuleID, handshake.IsProbe, nil
 }
 
 func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler MessageHandler) {
@@ -337,6 +348,37 @@ func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler Mess
 		}
 
 		s.handleMessage(sender, handler, msg)
+	}
+}
+
+// probeReadLoop handles probe connections - only responds to ping/pong messages.
+// Probe connections are used for tunnel health checks and should not affect the forwarder.
+func (s *Server) probeReadLoop(conn *websocket.Conn, sender *connSender) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				logger.Debug("probe connection read error", "error", err)
+			}
+			return
+		}
+
+		msg, err := DecodeMessage(bytes.NewReader(data))
+		if err != nil {
+			logger.Debug("probe decode message error", "error", err)
+			continue
+		}
+
+		// Only handle ping messages for probe connections
+		if msg.Type == MsgPing {
+			sender.SendMessage(NewPongMessage())
+		}
 	}
 }
 

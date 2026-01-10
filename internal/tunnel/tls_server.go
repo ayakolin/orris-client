@@ -173,7 +173,7 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	writeMu := &sync.Mutex{}
 
 	// Perform handshake
-	ruleID, err := s.performHandshake(conn, writeMu)
+	ruleID, isProbe, err := s.performHandshake(conn, writeMu)
 	if err != nil {
 		logger.Error("tls tunnel handshake failed", "remote", remoteAddr, "error", err)
 		conn.Close()
@@ -182,6 +182,17 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 
 	// Create sender
 	sender := &tlsConnSender{conn: conn, mu: writeMu}
+
+	// Handle probe connections separately - only respond to ping/pong, don't affect forwarder
+	if isProbe {
+		logger.Info("probe connection established via tls", "remote", remoteAddr, "rule_id", ruleID)
+		defer func() {
+			conn.Close()
+			logger.Info("probe connection closed via tls", "remote", remoteAddr, "rule_id", ruleID)
+		}()
+		s.probeReadLoop(conn, sender)
+		return
+	}
 
 	// Get handler for this rule, with retry for startup race condition
 	// Handler may not be registered yet if forwarder is still connecting to next hop
@@ -252,7 +263,7 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	s.readLoop(conn, sender, handler)
 }
 
-func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (string, error) {
+func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, err error) {
 	// Set read deadline for handshake
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -261,12 +272,12 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (string
 	reader := bufio.NewReader(conn)
 	handshakeData, err := readLengthPrefixedData(reader)
 	if err != nil {
-		return "", fmt.Errorf("read handshake: %w", err)
+		return "", false, fmt.Errorf("read handshake: %w", err)
 	}
 
 	var handshake forward.TunnelHandshake
 	if err := json.Unmarshal(handshakeData, &handshake); err != nil {
-		return "", fmt.Errorf("unmarshal handshake: %w", err)
+		return "", false, fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
 	// Log received token info for debugging
@@ -274,7 +285,7 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (string
 	if len(tokenDbg) > 15 {
 		tokenDbg = tokenDbg[:15] + "..."
 	}
-	logger.Debug("received tls tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg)
+	logger.Debug("received tls tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe)
 
 	// Verify handshake via server API with timeout
 	logger.Debug("verifying tls handshake via server API", "rule_id", handshake.RuleID)
@@ -292,23 +303,23 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (string
 		writeMu.Lock()
 		writeLengthPrefixedData(conn, resultData)
 		writeMu.Unlock()
-		return "", fmt.Errorf("verify handshake via server: %w", err)
+		return "", false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
 	// Send success result
 	resultData, err := json.Marshal(result)
 	if err != nil {
-		return "", fmt.Errorf("marshal result: %w", err)
+		return "", false, fmt.Errorf("marshal result: %w", err)
 	}
 	writeMu.Lock()
 	err = writeLengthPrefixedData(conn, resultData)
 	writeMu.Unlock()
 	if err != nil {
-		return "", fmt.Errorf("send result: %w", err)
+		return "", false, fmt.Errorf("send result: %w", err)
 	}
 
-	logger.Info("tls tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID)
-	return handshake.RuleID, nil
+	logger.Info("tls tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe)
+	return handshake.RuleID, handshake.IsProbe, nil
 }
 
 func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender, handler MessageHandler) {
@@ -329,6 +340,32 @@ func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender, handler Messa
 		}
 
 		s.handleMessage(sender, handler, msg)
+	}
+}
+
+// probeReadLoop handles probe connections - only responds to ping/pong messages.
+// Probe connections are used for tunnel health checks and should not affect the forwarder.
+func (s *TLSServer) probeReadLoop(conn net.Conn, sender *tlsConnSender) {
+	reader := bufio.NewReader(conn)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := DecodeMessage(reader)
+		if err != nil {
+			if err != io.EOF && s.ctx.Err() == nil {
+				logger.Debug("probe connection read error", "error", err)
+			}
+			return
+		}
+
+		// Only handle ping messages for probe connections
+		if msg.Type == MsgPing {
+			sender.SendMessage(NewPongMessage())
+		}
 	}
 }
 

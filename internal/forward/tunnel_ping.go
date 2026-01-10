@@ -179,6 +179,7 @@ func (p *TunnelPinger) pingWS(ctx context.Context) *TunnelPingResult {
 	handshake := TunnelHandshake{
 		AgentToken: p.token,
 		RuleID:     p.ruleID,
+		IsProbe:    true,
 	}
 	handshakeData, _ := json.Marshal(handshake)
 	if err := conn.WriteMessage(websocket.TextMessage, handshakeData); err != nil {
@@ -329,6 +330,7 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 	handshake := TunnelHandshake{
 		AgentToken: p.token,
 		RuleID:     p.ruleID,
+		IsProbe:    true,
 	}
 	handshakeData, _ := json.Marshal(handshake)
 
