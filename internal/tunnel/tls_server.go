@@ -33,6 +33,7 @@ type TLSServer struct {
 	conns       map[net.Conn]struct{}
 	connLock    map[net.Conn]*sync.Mutex    // per-connection write lock
 	connHandler map[net.Conn]MessageHandler // per-connection handler (by ruleID)
+	connRuleID  map[net.Conn]string         // per-connection ruleID
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,6 +50,7 @@ func NewTLSServer(port uint16, client *forward.Client, rules []forward.Rule) *TL
 		conns:       make(map[net.Conn]struct{}),
 		connLock:    make(map[net.Conn]*sync.Mutex),
 		connHandler: make(map[net.Conn]MessageHandler),
+		connRuleID:  make(map[net.Conn]string),
 	}
 }
 
@@ -60,10 +62,34 @@ func (s *TLSServer) UpdateRules(rules []forward.Rule) {
 }
 
 // AddHandler adds a message handler for a rule.
+// If replacing an existing handler, it updates all connections using the old handler.
 func (s *TLSServer) AddHandler(ruleID string, handler MessageHandler) {
 	s.handlerMu.Lock()
+	oldHandler := s.handlers[ruleID]
 	s.handlers[ruleID] = handler
 	s.handlerMu.Unlock()
+
+	// If replacing an existing handler, update all connections using it
+	if oldHandler != nil {
+		// Notify old handler to disconnect (close all its connections)
+		oldHandler.OnTunnelDisconnect()
+
+		// Update connHandler for all connections with this ruleID
+		s.connMu.Lock()
+		for conn, rid := range s.connRuleID {
+			if rid == ruleID {
+				s.connHandler[conn] = handler
+				// Update sender for new handler
+				if sh, ok := handler.(interface{ SetSender(Sender) }); ok {
+					mu := s.connLock[conn]
+					sh.SetSender(&tlsConnSender{conn: conn, mu: mu})
+				}
+			}
+		}
+		s.connMu.Unlock()
+
+		logger.Info("updated handler for existing connections", "rule_id", ruleID)
+	}
 }
 
 // RemoveHandler removes a message handler.
@@ -130,6 +156,7 @@ func (s *TLSServer) Stop() error {
 	s.conns = make(map[net.Conn]struct{})
 	s.connLock = make(map[net.Conn]*sync.Mutex)
 	s.connHandler = make(map[net.Conn]MessageHandler)
+	s.connRuleID = make(map[net.Conn]string)
 	s.connMu.Unlock()
 
 	if s.listener != nil {
@@ -226,11 +253,6 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 		}
 	}
 
-	// Set sender for the handler
-	if sh, ok := handler.(interface{ SetSender(Sender) }); ok {
-		sh.SetSender(sender)
-	}
-
 	// Check if server is shutting down before registering connection.
 	// This prevents race condition where Stop() clears maps but we add after.
 	s.connMu.Lock()
@@ -242,7 +264,28 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	s.conns[conn] = struct{}{}
 	s.connLock[conn] = writeMu
 	s.connHandler[conn] = handler
+	s.connRuleID[conn] = ruleID
 	s.connMu.Unlock()
+
+	// Double-check: if handler was replaced while we were setting up, use the new one.
+	// This handles the race condition where AddHandler is called between getting
+	// the handler from handlers map and registering the connection.
+	s.handlerMu.RLock()
+	currentHandler := s.handlers[ruleID]
+	s.handlerMu.RUnlock()
+
+	if currentHandler != nil && currentHandler != handler {
+		s.connMu.Lock()
+		s.connHandler[conn] = currentHandler
+		s.connMu.Unlock()
+		handler = currentHandler
+		logger.Info("handler was updated during connection setup, using new handler", "rule_id", ruleID)
+	}
+
+	// Set sender for the handler (after ensuring we have the latest handler)
+	if sh, ok := handler.(interface{ SetSender(Sender) }); ok {
+		sh.SetSender(sender)
+	}
 
 	logger.Info("entry agent connected via tls", "remote", remoteAddr, "rule_id", ruleID)
 
@@ -255,12 +298,13 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 		delete(s.conns, conn)
 		delete(s.connLock, conn)
 		delete(s.connHandler, conn)
+		delete(s.connRuleID, conn)
 		s.connMu.Unlock()
 		conn.Close()
 		logger.Info("entry agent disconnected from tls", "remote", remoteAddr, "rule_id", ruleID)
 	}()
 
-	s.readLoop(conn, sender, handler)
+	s.readLoop(conn, sender)
 }
 
 func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, err error) {
@@ -322,7 +366,7 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID
 	return handshake.RuleID, handshake.IsProbe, nil
 }
 
-func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender, handler MessageHandler) {
+func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender) {
 	reader := bufio.NewReader(conn)
 	for {
 		select {
@@ -337,6 +381,16 @@ func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender, handler Messa
 				logger.Error("tls tunnel read error", "error", err)
 			}
 			return
+		}
+
+		// Get current handler from map to support hot-swapping during config sync
+		s.connMu.RLock()
+		handler := s.connHandler[conn]
+		s.connMu.RUnlock()
+
+		if handler == nil {
+			logger.Warn("no handler for connection, skipping message")
+			continue
 		}
 
 		s.handleMessage(sender, handler, msg)
