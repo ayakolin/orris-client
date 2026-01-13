@@ -42,7 +42,7 @@ jobs:
             GOOS="${platform%/*}"
             GOARCH="${platform#*/}"
             echo "Building for ${GOOS}/${GOARCH}..."
-            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o dist/orris-client-${GOOS}-${GOARCH} ./cmd/orris-client
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o dist/orris-client-${GOOS}-${GOARCH} ./cmd/orris-client
           done
 
       - name: Compress with UPX
