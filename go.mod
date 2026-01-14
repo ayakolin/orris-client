@@ -8,12 +8,12 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/prometheus/procfs v0.19.2
-	github.com/refraction-networking/utls v1.8.1
+	github.com/refraction-networking/utls v1.8.2
 )
 
 require (
-	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/klauspost/compress v1.17.4 // indirect
-	golang.org/x/crypto v0.36.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	github.com/andybalholm/brotli v1.2.0 // indirect
+	github.com/klauspost/compress v1.18.2 // indirect
+	golang.org/x/crypto v0.47.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 )
