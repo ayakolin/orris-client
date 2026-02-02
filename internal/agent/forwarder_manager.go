@@ -186,33 +186,66 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Entry role: establish tunnel to exit agent
-			var t tunnel.TunnelClient
-			var err error
+			var ef *forwarder.EntryForwarder
 
-			// If NextHopAddress is already provided, use it directly
-			// Otherwise, query endpoint via GetExitEndpoint if NextHopAgentID is set
+			// If NextHopAddress is already provided, use it directly (single tunnel)
 			if rule.NextHopAddress != "" {
-				t, err = a.getOrCreateTunnelByAddress(rule)
-			} else if rule.NextHopAgentID != "" {
-				t, err = a.getOrCreateTunnel(rule)
+				t, err := a.getOrCreateTunnelByAddress(rule)
+				if err != nil {
+					errMsg := fmt.Errorf("create tunnel: %w", err)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+					return errMsg
+				}
+				ef = forwarder.NewEntryForwarder(rule, t)
+				t.SetHandler(ef)
+			} else if len(rule.ExitAgents) > 1 {
+				// Multiple exit agents: use load balancing mode
+				tunnels, weights, err := a.getOrCreateTunnels(rule)
+				if err != nil {
+					errMsg := fmt.Errorf("create tunnels for load balancing: %w", err)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+					return errMsg
+				}
+				// Get health check config for load balancing failover
+				healthConfig := a.getHealthCheckConfig(rule.ID)
+				// Extract exit agent IDs for health reporting
+				exitAgentIDs := make([]string, len(rule.ExitAgents))
+				for i, ea := range rule.ExitAgents {
+					exitAgentIDs[i] = ea.AgentID
+				}
+				ef = forwarder.NewEntryForwarderWithTunnels(rule, tunnels, weights, healthConfig, exitAgentIDs)
+				// Set health change callback to report to server
+				ef.SetHealthChangeCallback(a.createHealthChangeCallback())
+				// Set handler on all tunnels
+				for _, t := range tunnels {
+					t.SetHandler(ef)
+				}
+				// Store tunnels for cleanup (use rule ID with suffix for multi-tunnel)
+				a.storeMultiTunnels(rule.ID, tunnels)
+				logger.Info("entry forwarder using load balancing",
+					"rule_id", rule.ID,
+					"tunnel_count", len(tunnels),
+					"strategy", string(rule.LoadBalanceStrategy),
+					"health_check_enabled", healthConfig != nil)
+			} else if rule.NextHopAgentID != "" || rule.ExitAgentID != "" || len(rule.ExitAgents) == 1 {
+				// Single exit agent mode
+				t, err := a.getOrCreateTunnel(rule)
+				if err != nil {
+					errMsg := fmt.Errorf("create tunnel: %w", err)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+					return errMsg
+				}
+				ef = forwarder.NewEntryForwarder(rule, t)
+				t.SetHandler(ef)
 			} else {
 				err := fmt.Errorf("entry rule missing next hop info")
 				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
-			if err != nil {
-				errMsg := fmt.Errorf("create tunnel: %w", err)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-				return errMsg
-			}
 
-			ef := forwarder.NewEntryForwarder(rule, t)
-			t.SetHandler(ef)
 			if err := ef.Start(a.ctx); err != nil {
-				// Cleanup: stop tunnel on forwarder start failure
-				if stopErr := t.Stop(); stopErr != nil {
-					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
-				}
+				// Cleanup: stop tunnels on forwarder start failure
+				a.cleanupTunnelsForRule(rule.ID)
 				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
 				return err
 			}
@@ -432,10 +465,19 @@ func (a *Agent) stopForwarder(ruleID string, updateStatus bool) {
 		delete(a.forwarders, ruleID)
 	}
 
-	// Stop tunnel if exists
+	// Stop single tunnel if exists
 	if t, exists := a.tunnels[ruleID]; exists {
 		t.Stop()
 		delete(a.tunnels, ruleID)
+	}
+
+	// Stop multi-tunnels (indexed keys like "ruleID:0", "ruleID:1", ...)
+	prefix := ruleID + ":"
+	for key, t := range a.tunnels {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			t.Stop()
+			delete(a.tunnels, key)
+		}
 	}
 
 	a.tunnelsMu.Unlock()
@@ -518,5 +560,36 @@ func (a *Agent) updateRulesList(data *forward.ConfigSyncData) {
 	}
 	if a.tlsTunnelServer != nil {
 		a.tlsTunnelServer.UpdateRules(a.rules)
+	}
+}
+
+// createHealthChangeCallback creates a callback for health status changes.
+// The callback sends tunnel health reports to the server via hub connection.
+func (a *Agent) createHealthChangeCallback() forwarder.HealthChangeCallback {
+	return func(report *forward.TunnelHealthReport) {
+		a.hubConnMu.RLock()
+		conn := a.hubConn
+		a.hubConnMu.RUnlock()
+
+		if conn == nil {
+			logger.Debug("cannot send health report: hub not connected",
+				"rule_id", report.RuleID,
+				"exit_agent_id", report.ExitAgentID)
+			return
+		}
+
+		if err := conn.SendTunnelHealthReport(report); err != nil {
+			logger.Warn("failed to send tunnel health report",
+				"rule_id", report.RuleID,
+				"exit_agent_id", report.ExitAgentID,
+				"healthy", report.Healthy,
+				"error", err)
+		} else {
+			logger.Info("sent tunnel health report",
+				"rule_id", report.RuleID,
+				"exit_agent_id", report.ExitAgentID,
+				"healthy", report.Healthy,
+				"fail_count", report.FailCount)
+		}
 	}
 }

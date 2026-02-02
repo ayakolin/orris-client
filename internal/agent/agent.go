@@ -53,6 +53,10 @@ type Agent struct {
 	tunnelsMu sync.RWMutex
 	tunnels   map[string]tunnel.TunnelClient // ruleID -> tunnel (WS or TLS)
 
+	// Health check configurations for load balancing failover
+	healthCheckMu      sync.RWMutex
+	healthCheckConfigs map[string]*forward.HealthCheckConfig // ruleID -> config
+
 	// Rule status tracking
 	ruleStatusMu sync.RWMutex
 	ruleStatus   map[string]*ruleStatus // ruleID -> status
@@ -89,6 +93,7 @@ func New(cfg *config.Config) *Agent {
 		collector:          status.NewCollector(),
 		forwarders:         make(map[string]forwarder.Forwarder),
 		tunnels:            make(map[string]tunnel.TunnelClient),
+		healthCheckConfigs: make(map[string]*forward.HealthCheckConfig),
 		ruleStatus:         make(map[string]*ruleStatus),
 		ruleStatusReportCh: make(chan struct{}, 1), // buffered to avoid blocking
 	}
@@ -207,4 +212,28 @@ func (a *Agent) isProtocolBlockedUnsafe(protocol string) bool {
 		}
 	}
 	return false
+}
+
+// saveHealthCheckConfig saves the health check config for a rule.
+func (a *Agent) saveHealthCheckConfig(ruleID string, config *forward.HealthCheckConfig) {
+	if config == nil {
+		return
+	}
+	a.healthCheckMu.Lock()
+	a.healthCheckConfigs[ruleID] = config
+	a.healthCheckMu.Unlock()
+}
+
+// getHealthCheckConfig returns the health check config for a rule.
+func (a *Agent) getHealthCheckConfig(ruleID string) *forward.HealthCheckConfig {
+	a.healthCheckMu.RLock()
+	defer a.healthCheckMu.RUnlock()
+	return a.healthCheckConfigs[ruleID]
+}
+
+// deleteHealthCheckConfig removes the health check config for a rule.
+func (a *Agent) deleteHealthCheckConfig(ruleID string) {
+	a.healthCheckMu.Lock()
+	delete(a.healthCheckConfigs, ruleID)
+	a.healthCheckMu.Unlock()
 }

@@ -132,6 +132,9 @@ const (
 
 	// Rule sync status message types.
 	MsgTypeRuleSyncStatus = "rule_sync_status" // Agent -> Server: send rule sync status ([]RuleSyncStatusItem)
+
+	// Tunnel health report message types.
+	MsgTypeTunnelHealthReport = "tunnel_health_report" // Agent -> Server: report tunnel health status (TunnelHealthReport)
 )
 
 // CommandData represents a command sent from server to agent.
@@ -242,6 +245,22 @@ type ConfigSyncData struct {
 	// Agents should verify tokens via the server API, not using local HMAC verification.
 }
 
+// ExitAgentSyncData represents an exit agent with connection info for load balancing.
+type ExitAgentSyncData struct {
+	AgentID string `json:"agent_id"` // Stripe-style prefixed ID
+	Weight  uint16 `json:"weight"`   // Load balancing weight (0-100, 0=backup)
+	Address string `json:"address"`  // Exit agent public address
+	WsPort  uint16 `json:"ws_port"`  // Exit agent WebSocket port
+	TlsPort uint16 `json:"tls_port"` // Exit agent TLS port
+	Online  bool   `json:"online"`   // Exit agent online status
+}
+
+// HealthCheckConfig represents health check configuration for load balancing failover.
+type HealthCheckConfig struct {
+	UnhealthyThreshold uint32 `json:"unhealthy_threshold"` // Number of failures before marking unhealthy (default: 2)
+	HealthyThreshold   uint32 `json:"healthy_threshold"`   // Number of successes before marking healthy (default: 1)
+}
+
 // RuleSyncData represents rule synchronization data (aligned with server DTO).
 type RuleSyncData struct {
 	ID                     string   `json:"id"`       // Stripe-style prefixed ID (e.g., "fr_xK9mP2vL3nQ")
@@ -265,9 +284,13 @@ type RuleSyncData struct {
 	HopMode                string   `json:"hop_mode,omitempty"`                  // Hop mode: "tunnel", "direct", or "boundary"
 	InboundMode            string   `json:"inbound_mode,omitempty"`              // For boundary nodes: inbound mode
 	OutboundMode           string   `json:"outbound_mode,omitempty"`             // For boundary nodes: outbound mode
-	ChainAgentIDs []string `json:"chain_agent_ids,omitempty"`
-	ChainPosition int      `json:"chain_position,omitempty"`
-	IsLastInChain bool     `json:"is_last_in_chain,omitempty"`
+	ChainAgentIDs          []string `json:"chain_agent_ids,omitempty"`
+	ChainPosition          int      `json:"chain_position,omitempty"`
+	IsLastInChain          bool     `json:"is_last_in_chain,omitempty"`
+	// Multiple exit agents for load balancing (entry rules only, mutually exclusive with NextHop* fields)
+	ExitAgents          []ExitAgentSyncData `json:"exit_agents,omitempty"`
+	LoadBalanceStrategy string              `json:"load_balance_strategy,omitempty"` // Load balance strategy: "failover" (default), "weighted"
+	HealthCheck         *HealthCheckConfig  `json:"health_check,omitempty"`          // Health check config for load balancing failover
 }
 
 // ConfigAckData represents configuration acknowledgment data.
@@ -424,6 +447,18 @@ func (hc *HubConn) SendEvent(eventType, message string, extra any) error {
 			"message":    message,
 			"extra":      extra,
 		},
+	}
+	return hc.Send(msg)
+}
+
+// SendTunnelHealthReport sends a tunnel health status report to the server.
+// Entry agents should call this when they detect tunnel health changes to exit agents.
+// The server will notify other entry agents to update their load balancing decisions.
+func (hc *HubConn) SendTunnelHealthReport(report *TunnelHealthReport) error {
+	msg := &HubMessage{
+		Type:      MsgTypeTunnelHealthReport,
+		Timestamp: time.Now().Unix(),
+		Data:      report,
 	}
 	return hc.Send(msg)
 }

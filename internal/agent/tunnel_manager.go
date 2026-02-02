@@ -32,8 +32,9 @@ func tokenPrefix(token string) string {
 	return token[:10] + "..."
 }
 
-// getOrCreateTunnel creates a tunnel connection using TunnelType from rule.
+// getOrCreateTunnel creates a single tunnel connection using TunnelType from rule.
 // Returns TunnelClient interface that can be either WS or TLS client.
+// For single exit agent scenarios only. Use getOrCreateTunnels for load balancing.
 func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
@@ -43,13 +44,16 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, erro
 		return t, nil
 	}
 
-	// Use NextHopAgentID to get endpoint (ExitAgentID is deprecated in RuleSyncData)
+	// Get the single exit agent ID (priority: NextHopAgentID > ExitAgentID > ExitAgents[0])
 	agentID := rule.NextHopAgentID
 	if agentID == "" {
-		agentID = rule.ExitAgentID // fallback for legacy API response
+		agentID = rule.ExitAgentID
+	}
+	if agentID == "" && len(rule.ExitAgents) > 0 {
+		agentID = rule.ExitAgents[0].AgentID
 	}
 	if agentID == "" {
-		return nil, fmt.Errorf("no next hop agent ID specified")
+		return nil, fmt.Errorf("no exit agent ID specified")
 	}
 
 	endpoint, err := a.client.GetExitEndpoint(a.ctx, agentID)
@@ -71,6 +75,94 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, erro
 
 	a.tunnels[rule.ID] = t
 	return t, nil
+}
+
+// getOrCreateTunnels creates multiple tunnel connections for load balancing.
+// Returns tunnels and their corresponding weights.
+// Each exit agent gets one tunnel connection.
+func (a *Agent) getOrCreateTunnels(rule *forward.Rule) ([]tunnel.TunnelClient, []uint16, error) {
+	if len(rule.ExitAgents) == 0 {
+		return nil, nil, fmt.Errorf("no exit agents configured for load balancing")
+	}
+
+	tunnels := make([]tunnel.TunnelClient, 0, len(rule.ExitAgents))
+	weights := make([]uint16, 0, len(rule.ExitAgents))
+
+	for _, agent := range rule.ExitAgents {
+		endpoint, err := a.client.GetExitEndpoint(a.ctx, agent.AgentID)
+		if err != nil {
+			// Clean up already created tunnels on error
+			for _, t := range tunnels {
+				t.Stop()
+			}
+			return nil, nil, fmt.Errorf("get exit endpoint for %s: %w", agent.AgentID, err)
+		}
+
+		var t tunnel.TunnelClient
+
+		// Create tunnel based on TunnelType
+		if rule.TunnelType.IsTLS() {
+			t, err = a.createTLSClient(rule, endpoint.Address, endpoint.TlsPort, agent.AgentID)
+		} else {
+			t, err = a.createWSClient(rule, endpoint.Address, endpoint.WsPort, agent.AgentID)
+		}
+		if err != nil {
+			// Clean up already created tunnels on error
+			for _, t := range tunnels {
+				t.Stop()
+			}
+			return nil, nil, fmt.Errorf("create tunnel to %s: %w", agent.AgentID, err)
+		}
+
+		tunnels = append(tunnels, t)
+		weights = append(weights, agent.Weight)
+
+		logger.Info("tunnel created for load balancing",
+			"rule_id", rule.ID,
+			"agent_id", agent.AgentID,
+			"weight", agent.Weight)
+	}
+
+	return tunnels, weights, nil
+}
+
+// storeMultiTunnels stores multiple tunnels for a rule using indexed keys.
+// Keys are formatted as "ruleID:0", "ruleID:1", etc.
+func (a *Agent) storeMultiTunnels(ruleID string, tunnels []tunnel.TunnelClient) {
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
+
+	for i, t := range tunnels {
+		key := fmt.Sprintf("%s:%d", ruleID, i)
+		a.tunnels[key] = t
+	}
+}
+
+// cleanupTunnelsForRule stops and removes all tunnels associated with a rule.
+// This includes both single tunnel (keyed by ruleID) and multi-tunnels (keyed by "ruleID:0", "ruleID:1", etc.).
+// Used to clean up tunnels when forwarder fails to start.
+func (a *Agent) cleanupTunnelsForRule(ruleID string) {
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
+
+	// Stop single tunnel if exists
+	if t, exists := a.tunnels[ruleID]; exists {
+		if stopErr := t.Stop(); stopErr != nil {
+			logger.Error("failed to stop tunnel during cleanup", "rule_id", ruleID, "error", stopErr)
+		}
+		delete(a.tunnels, ruleID)
+	}
+
+	// Stop multi-tunnels (indexed keys like "ruleID:0", "ruleID:1", ...)
+	prefix := ruleID + ":"
+	for key, t := range a.tunnels {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			if stopErr := t.Stop(); stopErr != nil {
+				logger.Error("failed to stop tunnel during cleanup", "key", key, "error", stopErr)
+			}
+			delete(a.tunnels, key)
+		}
+	}
 }
 
 // createWSClient creates a WebSocket tunnel client.

@@ -42,14 +42,44 @@ func (t TunnelType) IsTLS() bool {
 	return t == TunnelTypeTLS
 }
 
+// LoadBalanceStrategy represents the load balancing strategy for multi-exit rules.
+type LoadBalanceStrategy string
+
+const (
+	// LoadBalanceStrategyFailover uses priority-based failover.
+	// Agents are tried in order of weight (highest first), with weight=0 as backup.
+	LoadBalanceStrategyFailover LoadBalanceStrategy = "failover"
+
+	// LoadBalanceStrategyWeighted distributes traffic based on weight ratios.
+	LoadBalanceStrategyWeighted LoadBalanceStrategy = "weighted"
+)
+
+// IsFailover returns true if the strategy is failover.
+func (s LoadBalanceStrategy) IsFailover() bool {
+	return s == LoadBalanceStrategyFailover || s == ""
+}
+
+// IsWeighted returns true if the strategy is weighted.
+func (s LoadBalanceStrategy) IsWeighted() bool {
+	return s == LoadBalanceStrategyWeighted
+}
+
+// ExitAgent represents an exit agent with weight for load balancing.
+type ExitAgent struct {
+	AgentID string `json:"agent_id"` // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
+	Weight  uint16 `json:"weight"`   // Weight for load balancing (0-100, 0=backup)
+}
+
 // Rule represents a forward rule returned by the API.
 // Note: ws_listen_port field has been removed (exit type deprecated).
 type Rule struct {
-	ID            string   `json:"id"`       // Stripe-style prefixed ID (e.g., "fr_xK9mP2vL3nQ")
-	AgentID       string   `json:"agent_id"` // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
-	RuleType      RuleType `json:"rule_type"`
-	ExitAgentID   string   `json:"exit_agent_id,omitempty"` // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
-	Name          string   `json:"name"`
+	ID                  string              `json:"id"`                                // Stripe-style prefixed ID (e.g., "fr_xK9mP2vL3nQ")
+	AgentID             string              `json:"agent_id"`                          // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
+	RuleType            RuleType            `json:"rule_type"`
+	ExitAgentID         string              `json:"exit_agent_id,omitempty"`           // Stripe-style prefixed ID (mutually exclusive with ExitAgents)
+	ExitAgents          []ExitAgent         `json:"exit_agents,omitempty"`             // For entry type with load balancing (mutually exclusive with ExitAgentID)
+	LoadBalanceStrategy LoadBalanceStrategy `json:"load_balance_strategy,omitempty"`   // Load balance strategy: failover (default), weighted
+	Name                string              `json:"name"`
 	ListenPort    uint16   `json:"listen_port"`
 	TargetAddress string   `json:"target_address,omitempty"`
 	TargetPort    uint16   `json:"target_port,omitempty"`
@@ -398,3 +428,16 @@ const (
 	RunStatusError    = "error"
 	RunStatusStarting = "starting"
 )
+
+// TunnelHealthReport represents a tunnel health status report from entry agent.
+// Entry agents periodically check tunnel connectivity to exit agents and report failures.
+// Used with MsgTypeTunnelHealthReport message type via HubConn.SendTunnelHealthReport().
+type TunnelHealthReport struct {
+	RuleID      string `json:"rule_id"`                // Rule ID (Stripe-style prefixed, e.g., "fr_xxx")
+	ExitAgentID string `json:"exit_agent_id"`          // Exit agent ID (Stripe-style prefixed, e.g., "fa_xxx")
+	Healthy     bool   `json:"healthy"`                // Whether the tunnel is healthy
+	FailCount   int    `json:"fail_count,omitempty"`   // Consecutive failure count (when unhealthy)
+	Error       string `json:"error,omitempty"`        // Error message (when unhealthy)
+	LatencyMs   *int64 `json:"latency_ms,omitempty"`   // Last measured latency in milliseconds (when healthy)
+	CheckedAt   int64  `json:"checked_at"`             // Health check timestamp (Unix seconds)
+}

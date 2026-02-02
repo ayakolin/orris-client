@@ -230,9 +230,14 @@ func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSync
 func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 	// Build rule map from added rules (no lock needed for local variable)
 	newRules := make(map[string]*forward.Rule)
+	newHealthConfigs := make(map[string]*forward.HealthCheckConfig)
 	for i := range data.Added {
 		rule := ruleSyncDataToRule(&data.Added[i])
 		newRules[rule.ID] = rule
+		// Collect health check configs
+		if data.Added[i].HealthCheck != nil {
+			newHealthConfigs[rule.ID] = data.Added[i].HealthCheck
+		}
 	}
 
 	// Acquire locks in order: rulesMu -> forwardersMu
@@ -270,6 +275,7 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 		if !exists {
 			// Rule removed - stop forwarder and clean up status
 			// Lock order: forwardersMu (held) -> ruleStatusMu (acquired by deleteRuleStatus)
+			// Note: healthCheckConfigs is replaced entirely at end of full sync, no need to delete here
 			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
 			f.Stop()
 			delete(a.forwarders, ruleID)
@@ -305,6 +311,11 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 	if a.tlsTunnelServer != nil {
 		a.tlsTunnelServer.UpdateRules(rulesCopy)
 	}
+
+	// Update health check configs (full sync replaces all)
+	a.healthCheckMu.Lock()
+	a.healthCheckConfigs = newHealthConfigs
+	a.healthCheckMu.Unlock()
 
 	// Restart forwarders with changed config
 	for _, rule := range toRestart {
@@ -348,7 +359,26 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 		old.OutboundMode != new.OutboundMode {
 		return true
 	}
+
+	// Check if ExitAgents changed (for load balancing)
+	if !exitAgentsEqual(old.ExitAgents, new.ExitAgents) {
+		return true
+	}
+
 	return false
+}
+
+// exitAgentsEqual compares two ExitAgent slices for equality.
+func exitAgentsEqual(a, b []forward.ExitAgent) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].AgentID != b[i].AgentID || a[i].Weight != b[i].Weight {
+			return false
+		}
+	}
+	return true
 }
 
 // handleIncrementalSync handles incremental configuration sync.
@@ -362,12 +392,19 @@ func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
 	for _, ruleID := range data.Removed {
 		a.stopForwarder(ruleID, false)
 		a.deleteRuleStatus(ruleID)
+		a.deleteHealthCheckConfig(ruleID)
 	}
 
 	// Handle updated rules (stop then start)
 	// updateStatus=false since startForwarder will set the new status
 	for i := range data.Updated {
 		rule := ruleSyncDataToRule(&data.Updated[i])
+		// Update health check config (may have changed)
+		if data.Updated[i].HealthCheck != nil {
+			a.saveHealthCheckConfig(rule.ID, data.Updated[i].HealthCheck)
+		} else {
+			a.deleteHealthCheckConfig(rule.ID)
+		}
 		a.stopForwarder(rule.ID, false)
 		if err := a.startForwarder(rule); err != nil {
 			logger.Error("restart forwarder failed", "rule_id", rule.ID, "error", err)
@@ -377,6 +414,10 @@ func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
 	// Handle added rules
 	for i := range data.Added {
 		rule := ruleSyncDataToRule(&data.Added[i])
+		// Save health check config if present (for load balancing)
+		if data.Added[i].HealthCheck != nil {
+			a.saveHealthCheckConfig(rule.ID, data.Added[i].HealthCheck)
+		}
 		if err := a.startForwarder(rule); err != nil {
 			logger.Error("start forwarder failed", "rule_id", rule.ID, "error", err)
 		}
@@ -389,7 +430,27 @@ func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
 }
 
 // ruleSyncDataToRule converts RuleSyncData to forward.Rule.
+// Note: This filters out offline exit agents based on the Online field.
 func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
+	// Convert ExitAgentSyncData to ExitAgent, filtering out offline agents
+	var exitAgents []forward.ExitAgent
+	if len(data.ExitAgents) > 0 {
+		exitAgents = make([]forward.ExitAgent, 0, len(data.ExitAgents))
+		for _, ea := range data.ExitAgents {
+			// Skip offline agents
+			if !ea.Online {
+				logger.Debug("skipping offline exit agent",
+					"rule_id", data.ID,
+					"agent_id", ea.AgentID)
+				continue
+			}
+			exitAgents = append(exitAgents, forward.ExitAgent{
+				AgentID: ea.AgentID,
+				Weight:  ea.Weight,
+			})
+		}
+	}
+
 	return &forward.Rule{
 		ID:                     data.ID,
 		AgentID:                data.AgentID,
@@ -414,6 +475,8 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		ChainAgentIDs:          data.ChainAgentIDs,
 		ChainPosition:          data.ChainPosition,
 		IsLastInChain:          data.IsLastInChain,
+		ExitAgents:             exitAgents,
+		LoadBalanceStrategy:    forward.LoadBalanceStrategy(data.LoadBalanceStrategy),
 	}
 }
 
