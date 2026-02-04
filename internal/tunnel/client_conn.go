@@ -114,10 +114,8 @@ func (c *Client) connect() error {
 		},
 	}
 
-	header := make(map[string][]string)
-	header["Authorization"] = []string{"Bearer " + token}
-
-	conn, _, err := dialer.DialContext(c.ctx, endpoint, header)
+	// No Authorization header - token is in handshake payload (less DPI fingerprint)
+	conn, _, err := dialer.DialContext(c.ctx, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -145,7 +143,11 @@ func (c *Client) connect() error {
 		conn.Close()
 		return fmt.Errorf("marshal handshake: %w", err)
 	}
-	if err := conn.WriteMessage(websocket.TextMessage, handshakeData); err != nil {
+
+	// Obfuscate handshake data (XOR + random padding)
+	obfuscatedData := ObfuscateHandshake(handshakeData)
+
+	if err := conn.WriteMessage(websocket.BinaryMessage, obfuscatedData); err != nil {
 		conn.Close()
 		return fmt.Errorf("send handshake: %w", err)
 	}
@@ -159,8 +161,15 @@ func (c *Client) connect() error {
 	}
 	conn.SetReadDeadline(time.Time{}) // Clear deadline
 
+	// Deobfuscate result
+	deobfuscatedResult, err := DeobfuscateHandshake(resultData)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("deobfuscate handshake result: %w", err)
+	}
+
 	var result forward.TunnelHandshakeResult
-	if err := json.Unmarshal(resultData, &result); err != nil {
+	if err := json.Unmarshal(deobfuscatedResult, &result); err != nil {
 		conn.Close()
 		return fmt.Errorf("unmarshal handshake result: %w", err)
 	}

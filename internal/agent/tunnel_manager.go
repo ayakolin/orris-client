@@ -167,7 +167,7 @@ func (a *Agent) cleanupTunnelsForRule(ruleID string) {
 
 // createWSClient creates a WebSocket tunnel client.
 func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.Client, error) {
-	wsURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
+	wsURL := fmt.Sprintf("wss://%s/ws", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
@@ -175,7 +175,7 @@ func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, 
 		if err != nil {
 			return "", "", err
 		}
-		newURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
+		newURL := fmt.Sprintf("wss://%s/ws", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
 		return newURL, a.getHandshakeToken(), nil
 	}
 
@@ -269,7 +269,7 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (tunnel.TunnelCli
 
 // createWSClientByAddress creates a WebSocket tunnel client using explicit address.
 func (a *Agent) createWSClientByAddress(rule *forward.Rule, token string) (*tunnel.Client, error) {
-	wsURL := fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
+	wsURL := fmt.Sprintf("wss://%s/ws", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
 
 	// Create endpoint refresher for chain rules
 	ruleID := rule.ID
@@ -282,7 +282,7 @@ func (a *Agent) createWSClientByAddress(rule *forward.Rule, token string) (*tunn
 		// Update local rule cache
 		a.updateRuleCache(refreshedRule)
 
-		newURL := fmt.Sprintf("wss://%s/tunnel",
+		newURL := fmt.Sprintf("wss://%s/ws",
 			net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopWsPort)))
 
 		// Use refreshed token if available
@@ -446,7 +446,7 @@ func (a *Agent) getTunnelServer(tunnelType forward.TunnelType) tunnel.TunnelServ
 
 // createSmuxClient creates a SMUX tunnel client.
 // For tls_smux: endpoint is "host:port"
-// For ws_smux: endpoint is "wss://host:port/tunnel"
+// For ws_smux: endpoint is "wss://host:port/ws"
 func (a *Agent) createSmuxClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.SmuxClient, error) {
 	useTLS := rule.TunnelType.IsTLSSmux()
 
@@ -454,7 +454,7 @@ func (a *Agent) createSmuxClient(rule *forward.Rule, address string, port uint16
 	if useTLS {
 		endpoint = net.JoinHostPort(address, fmt.Sprintf("%d", port))
 	} else {
-		endpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
+		endpoint = fmt.Sprintf("wss://%s/ws", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
 	}
 
 	// Create endpoint refresher
@@ -467,7 +467,7 @@ func (a *Agent) createSmuxClient(rule *forward.Rule, address string, port uint16
 		if useTLS {
 			newEndpoint = net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.TlsPort))
 		} else {
-			newEndpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
+			newEndpoint = fmt.Sprintf("wss://%s/ws", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
 		}
 		return newEndpoint, a.getHandshakeToken(), nil
 	}
@@ -531,7 +531,7 @@ func (a *Agent) createSmuxClientByAddress(rule *forward.Rule) (*tunnel.SmuxClien
 		endpoint = net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", port))
 	} else {
 		port = rule.NextHopWsPort
-		endpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", port)))
+		endpoint = fmt.Sprintf("wss://%s/ws", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", port)))
 	}
 
 	// Use NextHopConnectionToken if available, otherwise fall back to handshake token
@@ -560,7 +560,7 @@ func (a *Agent) createSmuxClientByAddress(rule *forward.Rule) (*tunnel.SmuxClien
 		if useTLS {
 			newEndpoint = net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopTlsPort))
 		} else {
-			newEndpoint = fmt.Sprintf("wss://%s/tunnel",
+			newEndpoint = fmt.Sprintf("wss://%s/ws",
 				net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopWsPort)))
 		}
 

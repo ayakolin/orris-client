@@ -87,8 +87,8 @@ func NewServer(port uint16, client *forward.Client, rules []forward.Rule) *Serve
 		smuxSessions: make(map[*smux.Session]string),
 		smuxConfig:   DefaultSmuxConfig(),
 		upgrader: websocket.Upgrader{
-			ReadBufferSize:  64 * 1024,
-			WriteBufferSize: 64 * 1024,
+			ReadBufferSize:  256 * 1024,
+			WriteBufferSize: 256 * 1024,
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
@@ -192,7 +192,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.port = uint16(tcpListener.Addr().(*net.TCPAddr).Port)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/tunnel", s.handleTunnel)
+	mux.HandleFunc("/ws", s.handleTunnel)
 
 	s.server = &http.Server{
 		Handler: mux,
@@ -374,8 +374,14 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ru
 		return "", false, false, fmt.Errorf("read handshake: %w", err)
 	}
 
+	// Deobfuscate handshake data
+	deobfuscatedData, err := DeobfuscateHandshake(data)
+	if err != nil {
+		return "", false, false, fmt.Errorf("deobfuscate handshake: %w", err)
+	}
+
 	var handshake forward.TunnelHandshake
-	if err := json.Unmarshal(data, &handshake); err != nil {
+	if err := json.Unmarshal(deobfuscatedData, &handshake); err != nil {
 		return "", false, false, fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
@@ -393,25 +399,27 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ru
 	defer verifyCancel()
 	result, err := s.client.VerifyTunnelHandshakeViaServer(verifyCtx, &handshake)
 	if err != nil {
-		// Send failure result
+		// Send failure result (obfuscated)
 		failResult := &forward.TunnelHandshakeResult{
 			Success: false,
 			Error:   fmt.Sprintf("server verification failed: %v", err),
 		}
 		resultData, _ := json.Marshal(failResult)
+		obfuscatedResult := ObfuscateHandshake(resultData)
 		writeMu.Lock()
-		conn.WriteMessage(websocket.TextMessage, resultData)
+		conn.WriteMessage(websocket.BinaryMessage, obfuscatedResult)
 		writeMu.Unlock()
 		return "", false, false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
-	// Send success result
+	// Send success result (obfuscated)
 	resultData, err := json.Marshal(result)
 	if err != nil {
 		return "", false, false, fmt.Errorf("marshal result: %w", err)
 	}
+	obfuscatedResult := ObfuscateHandshake(resultData)
 	writeMu.Lock()
-	err = conn.WriteMessage(websocket.TextMessage, resultData)
+	err = conn.WriteMessage(websocket.BinaryMessage, obfuscatedResult)
 	writeMu.Unlock()
 	if err != nil {
 		return "", false, false, fmt.Errorf("send result: %w", err)

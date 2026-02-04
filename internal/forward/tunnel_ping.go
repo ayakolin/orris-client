@@ -6,7 +6,9 @@ package forward
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -18,6 +20,60 @@ import (
 	"github.com/gorilla/websocket"
 	utls "github.com/refraction-networking/utls"
 )
+
+// Handshake obfuscation to reduce DPI fingerprint.
+// Format: [padding_len:1][padding:N][xor_data:M]
+// XOR key is derived from a fixed seed to avoid transmitting key.
+
+var obfuscateKey = []byte{0x7a, 0x3f, 0x9c, 0x2e, 0x5d, 0x8b, 0x1a, 0x4f, 0x6c, 0x0e, 0x9d, 0x3b, 0x7f, 0x2c, 0x5a, 0x8e}
+
+// obfuscateHandshake obfuscates handshake data with XOR and random padding.
+func obfuscateHandshake(data []byte) []byte {
+	// Generate random padding (8-64 bytes)
+	paddingLen := 8 + randomByte()%57
+	padding := make([]byte, paddingLen)
+	rand.Read(padding)
+
+	// XOR the data
+	xorData := make([]byte, len(data))
+	for i := range data {
+		xorData[i] = data[i] ^ obfuscateKey[i%len(obfuscateKey)]
+	}
+
+	// Format: [padding_len:1][padding:N][xor_data:M]
+	result := make([]byte, 1+int(paddingLen)+len(xorData))
+	result[0] = paddingLen
+	copy(result[1:1+int(paddingLen)], padding)
+	copy(result[1+int(paddingLen):], xorData)
+
+	return result
+}
+
+// deobfuscateHandshake reverses the obfuscation.
+func deobfuscateHandshake(data []byte) ([]byte, error) {
+	if len(data) < 2 {
+		return nil, errors.New("obfuscated data too short")
+	}
+
+	paddingLen := int(data[0])
+	if len(data) < 1+paddingLen {
+		return nil, errors.New("invalid padding length")
+	}
+
+	xorData := data[1+paddingLen:]
+	result := make([]byte, len(xorData))
+	for i := range xorData {
+		result[i] = xorData[i] ^ obfuscateKey[i%len(obfuscateKey)]
+	}
+
+	return result, nil
+}
+
+func randomByte() byte {
+	b := make([]byte, 1)
+	rand.Read(b)
+	return b[0]
+}
 
 // TunnelPingResult contains the results of a tunnel ping operation.
 type TunnelPingResult struct {
@@ -130,7 +186,7 @@ func (p *TunnelPinger) pingWS(ctx context.Context) *TunnelPingResult {
 
 	// Build WebSocket URL - use wss:// with uTLS
 	hostPort := net.JoinHostPort(p.target, fmt.Sprintf("%d", p.port))
-	wsURL := fmt.Sprintf("wss://%s/tunnel", hostPort)
+	wsURL := fmt.Sprintf("wss://%s/ws", hostPort)
 
 	// Create dialer with uTLS for wss:// connections
 	dialer := websocket.Dialer{
@@ -175,19 +231,20 @@ func (p *TunnelPinger) pingWS(ctx context.Context) *TunnelPingResult {
 	}
 	defer p.closeWSConn(conn)
 
-	// Perform tunnel handshake (JSON format)
+	// Perform tunnel handshake (JSON format with obfuscation)
 	handshake := TunnelHandshake{
 		AgentToken: p.token,
 		RuleID:     p.ruleID,
 		IsProbe:    true,
 	}
 	handshakeData, _ := json.Marshal(handshake)
-	if err := conn.WriteMessage(websocket.TextMessage, handshakeData); err != nil {
+	obfuscatedHandshake := obfuscateHandshake(handshakeData)
+	if err := conn.WriteMessage(websocket.BinaryMessage, obfuscatedHandshake); err != nil {
 		result.Error = fmt.Sprintf("write handshake: %v", err)
 		return result
 	}
 
-	// Read handshake response
+	// Read handshake response (obfuscated)
 	conn.SetReadDeadline(time.Now().Add(p.connTimeout))
 	_, respData, err := conn.ReadMessage()
 	if err != nil {
@@ -196,8 +253,15 @@ func (p *TunnelPinger) pingWS(ctx context.Context) *TunnelPingResult {
 	}
 	conn.SetReadDeadline(time.Time{})
 
+	// Deobfuscate response
+	deobfuscatedResp, err := deobfuscateHandshake(respData)
+	if err != nil {
+		result.Error = fmt.Sprintf("deobfuscate handshake response: %v", err)
+		return result
+	}
+
 	var handshakeResult TunnelHandshakeResult
-	if err := json.Unmarshal(respData, &handshakeResult); err != nil {
+	if err := json.Unmarshal(deobfuscatedResp, &handshakeResult); err != nil {
 		result.Error = fmt.Sprintf("parse handshake result: %v", err)
 		return result
 	}
@@ -326,33 +390,34 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 	default:
 	}
 
-	// Send handshake
+	// Send handshake (with obfuscation)
 	handshake := TunnelHandshake{
 		AgentToken: p.token,
 		RuleID:     p.ruleID,
 		IsProbe:    true,
 	}
 	handshakeData, _ := json.Marshal(handshake)
+	obfuscatedHandshake := obfuscateHandshake(handshakeData)
 
-	// Write handshake length + data
+	// Write handshake length + obfuscated data
 	if err := tlsConn.SetWriteDeadline(time.Now().Add(p.connTimeout)); err != nil {
 		result.Error = fmt.Sprintf("set write deadline: %v", err)
 		return result
 	}
 
 	// Write length (4 bytes, big endian)
-	length := uint32(len(handshakeData))
+	length := uint32(len(obfuscatedHandshake))
 	lengthBuf := []byte{byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length)}
 	if _, err := tlsConn.Write(lengthBuf); err != nil {
 		result.Error = fmt.Sprintf("write handshake length: %v", err)
 		return result
 	}
-	if _, err := tlsConn.Write(handshakeData); err != nil {
+	if _, err := tlsConn.Write(obfuscatedHandshake); err != nil {
 		result.Error = fmt.Sprintf("write handshake: %v", err)
 		return result
 	}
 
-	// Read handshake response
+	// Read handshake response (obfuscated)
 	if err := tlsConn.SetReadDeadline(time.Now().Add(p.connTimeout)); err != nil {
 		result.Error = fmt.Sprintf("set read deadline: %v", err)
 		return result
@@ -377,8 +442,15 @@ func (p *TunnelPinger) pingTLS(ctx context.Context) *TunnelPingResult {
 		return result
 	}
 
+	// Deobfuscate response
+	deobfuscatedResp, err := deobfuscateHandshake(respData)
+	if err != nil {
+		result.Error = fmt.Sprintf("deobfuscate handshake response: %v", err)
+		return result
+	}
+
 	var handshakeResult TunnelHandshakeResult
-	if err := json.Unmarshal(respData, &handshakeResult); err != nil {
+	if err := json.Unmarshal(deobfuscatedResp, &handshakeResult); err != nil {
 		result.Error = fmt.Sprintf("parse handshake result: %v", err)
 		return result
 	}

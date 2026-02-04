@@ -1,10 +1,65 @@
 package tunnel
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
 )
+
+// Handshake obfuscation to reduce DPI fingerprint.
+// Format: [padding_len:1][padding:N][xor_data:M]
+// XOR key is derived from a fixed seed to avoid transmitting key.
+
+var obfuscateKey = []byte{0x7a, 0x3f, 0x9c, 0x2e, 0x5d, 0x8b, 0x1a, 0x4f, 0x6c, 0x0e, 0x9d, 0x3b, 0x7f, 0x2c, 0x5a, 0x8e}
+
+// ObfuscateHandshake obfuscates handshake data with XOR and random padding.
+func ObfuscateHandshake(data []byte) []byte {
+	// Generate random padding (8-64 bytes)
+	paddingLen := 8 + randomByte()%57
+	padding := make([]byte, paddingLen)
+	rand.Read(padding)
+
+	// XOR the data
+	xorData := make([]byte, len(data))
+	for i := range data {
+		xorData[i] = data[i] ^ obfuscateKey[i%len(obfuscateKey)]
+	}
+
+	// Format: [padding_len:1][padding:N][xor_data:M]
+	result := make([]byte, 1+int(paddingLen)+len(xorData))
+	result[0] = paddingLen
+	copy(result[1:1+int(paddingLen)], padding)
+	copy(result[1+int(paddingLen):], xorData)
+
+	return result
+}
+
+// DeobfuscateHandshake reverses the obfuscation.
+func DeobfuscateHandshake(data []byte) ([]byte, error) {
+	if len(data) < 2 {
+		return nil, errors.New("obfuscated data too short")
+	}
+
+	paddingLen := int(data[0])
+	if len(data) < 1+paddingLen {
+		return nil, errors.New("invalid padding length")
+	}
+
+	xorData := data[1+paddingLen:]
+	result := make([]byte, len(xorData))
+	for i := range xorData {
+		result[i] = xorData[i] ^ obfuscateKey[i%len(obfuscateKey)]
+	}
+
+	return result, nil
+}
+
+func randomByte() byte {
+	b := make([]byte, 1)
+	rand.Read(b)
+	return b[0]
+}
 
 // MessageType represents the type of tunnel message.
 type MessageType uint8

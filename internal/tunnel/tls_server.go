@@ -363,12 +363,18 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 
-	// Read handshake message (length-prefixed JSON)
+	// Read handshake message (length-prefixed, obfuscated)
 	// Note: We read directly from conn to avoid bufio.Reader pre-reading data
 	// that would be lost when SMUX session takes over the connection.
-	handshakeData, err := readLengthPrefixedData(conn)
+	obfuscatedData, err := readLengthPrefixedData(conn)
 	if err != nil {
 		return "", false, false, fmt.Errorf("read handshake: %w", err)
+	}
+
+	// Deobfuscate handshake data
+	handshakeData, err := DeobfuscateHandshake(obfuscatedData)
+	if err != nil {
+		return "", false, false, fmt.Errorf("deobfuscate handshake: %w", err)
 	}
 
 	var handshake forward.TunnelHandshake
@@ -390,25 +396,27 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID
 	defer verifyCancel()
 	result, err := s.client.VerifyTunnelHandshakeViaServer(verifyCtx, &handshake)
 	if err != nil {
-		// Send failure result
+		// Send failure result (obfuscated)
 		failResult := &forward.TunnelHandshakeResult{
 			Success: false,
 			Error:   fmt.Sprintf("server verification failed: %v", err),
 		}
 		resultData, _ := json.Marshal(failResult)
+		obfuscatedResult := ObfuscateHandshake(resultData)
 		writeMu.Lock()
-		writeLengthPrefixedData(conn, resultData)
+		writeLengthPrefixedData(conn, obfuscatedResult)
 		writeMu.Unlock()
 		return "", false, false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
-	// Send success result
+	// Send success result (obfuscated)
 	resultData, err := json.Marshal(result)
 	if err != nil {
 		return "", false, false, fmt.Errorf("marshal result: %w", err)
 	}
+	obfuscatedResult := ObfuscateHandshake(resultData)
 	writeMu.Lock()
-	err = writeLengthPrefixedData(conn, resultData)
+	err = writeLengthPrefixedData(conn, obfuscatedResult)
 	writeMu.Unlock()
 	if err != nil {
 		return "", false, false, fmt.Errorf("send result: %w", err)

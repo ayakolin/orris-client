@@ -79,7 +79,7 @@ func WithSmuxInitialRetry(maxRetries int) SmuxClientOption {
 
 // NewSmuxClient creates a new SMUX tunnel client.
 // For TLS: endpoint is "host:port"
-// For WS: endpoint is "wss://host:port/tunnel"
+// For WS: endpoint is "wss://host:port/ws"
 func NewSmuxClient(endpoint, token, ruleID string, useTLS bool, opts ...SmuxClientOption) *SmuxClient {
 	c := &SmuxClient{
 		endpoint:   endpoint,
@@ -245,17 +245,20 @@ func (c *SmuxClient) connect() error {
 
 	if useTLS {
 		conn, err = c.dialTLS(endpoint)
+		if err != nil {
+			return err
+		}
+		// TLS mode: use length-prefixed handshake
+		if err := c.performTLSHandshake(conn, token, ruleID); err != nil {
+			conn.Close()
+			return err
+		}
 	} else {
-		conn, err = c.dialWS(endpoint, token)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Perform tunnel handshake
-	if err := c.performHandshake(conn, token, ruleID); err != nil {
-		conn.Close()
-		return err
+		// WS mode: handshake using WebSocket messages, then wrap as net.Conn
+		conn, err = c.dialWSWithHandshake(endpoint, token, ruleID)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Create SMUX session as client
@@ -311,12 +314,13 @@ func (c *SmuxClient) dialTLS(endpoint string) (net.Conn, error) {
 	return tlsConn, nil
 }
 
-// dialWS establishes a WebSocket connection and wraps it as net.Conn.
-func (c *SmuxClient) dialWS(endpoint, token string) (net.Conn, error) {
+// dialWSWithHandshake establishes a WebSocket connection, performs handshake using
+// WebSocket messages, then wraps as net.Conn for SMUX.
+func (c *SmuxClient) dialWSWithHandshake(endpoint, token, ruleID string) (net.Conn, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		ReadBufferSize:   64 * 1024,
-		WriteBufferSize:  64 * 1024,
+		ReadBufferSize:   256 * 1024,
+		WriteBufferSize:  256 * 1024,
 		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			var d net.Dialer
 			tcpConn, err := d.DialContext(ctx, network, addr)
@@ -335,23 +339,82 @@ func (c *SmuxClient) dialWS(endpoint, token string) (net.Conn, error) {
 		},
 	}
 
-	header := make(map[string][]string)
-	header["Authorization"] = []string{"Bearer " + token}
-
-	wsConn, _, err := dialer.DialContext(c.ctx, endpoint, header)
+	// No Authorization header - token is in handshake payload (less DPI fingerprint)
+	wsConn, _, err := dialer.DialContext(c.ctx, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial websocket: %w", err)
 	}
 
-	return NewWSConn(wsConn), nil
-}
-
-// performHandshake sends tunnel handshake and waits for response.
-func (c *SmuxClient) performHandshake(conn net.Conn, token, ruleID string) error {
+	// Perform handshake using WebSocket binary message (less obvious than TextMessage)
 	handshake := &forward.TunnelHandshake{
 		AgentToken: token,
 		RuleID:     ruleID,
-		EnableSmux: true, // Enable SMUX multiplexing
+		EnableSmux: true,
+	}
+
+	tokenDbg := token
+	if len(tokenDbg) > 15 {
+		tokenDbg = tokenDbg[:15] + "..."
+	}
+	logger.Debug("sending smux tunnel handshake via ws",
+		"rule_id", ruleID,
+		"token_prefix", tokenDbg)
+
+	handshakeData, err := json.Marshal(handshake)
+	if err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("marshal handshake: %w", err)
+	}
+
+	// Obfuscate handshake data (XOR + random padding)
+	obfuscatedData := ObfuscateHandshake(handshakeData)
+
+	// Send handshake as WebSocket binary message (reduce DPI fingerprint)
+	wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, obfuscatedData); err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("send handshake: %w", err)
+	}
+	wsConn.SetWriteDeadline(time.Time{})
+
+	// Read handshake result
+	wsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, resultData, err := wsConn.ReadMessage()
+	if err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("read handshake result: %w", err)
+	}
+	wsConn.SetReadDeadline(time.Time{})
+
+	// Deobfuscate result
+	deobfuscatedResult, err := DeobfuscateHandshake(resultData)
+	if err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("deobfuscate handshake result: %w", err)
+	}
+
+	var result forward.TunnelHandshakeResult
+	if err := json.Unmarshal(deobfuscatedResult, &result); err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("unmarshal handshake result: %w", err)
+	}
+	if !result.Success {
+		wsConn.Close()
+		return nil, fmt.Errorf("handshake failed: %s", result.Error)
+	}
+
+	logger.Info("smux tunnel handshake successful via ws", "entry_agent_id", result.EntryAgentID)
+
+	// Wrap as net.Conn for SMUX
+	return NewWSConn(wsConn), nil
+}
+
+// performTLSHandshake sends tunnel handshake over TLS using length-prefixed format.
+func (c *SmuxClient) performTLSHandshake(conn net.Conn, token, ruleID string) error {
+	handshake := &forward.TunnelHandshake{
+		AgentToken: token,
+		RuleID:     ruleID,
+		EnableSmux: true,
 	}
 
 	tokenDbg := token
@@ -359,7 +422,7 @@ func (c *SmuxClient) performHandshake(conn net.Conn, token, ruleID string) error
 		tokenDbg = tokenDbg[:15] + "..."
 	}
 	tokenParts := strings.SplitN(token, "_", 3)
-	logger.Debug("sending smux tunnel handshake",
+	logger.Debug("sending smux tunnel handshake via tls",
 		"rule_id", ruleID,
 		"token_prefix", tokenDbg,
 		"token_len", len(token),
@@ -370,9 +433,12 @@ func (c *SmuxClient) performHandshake(conn net.Conn, token, ruleID string) error
 		return fmt.Errorf("marshal handshake: %w", err)
 	}
 
+	// Obfuscate handshake data (XOR + random padding)
+	obfuscatedData := ObfuscateHandshake(handshakeData)
+
 	// Set write deadline to prevent blocking if server doesn't read
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := writeLengthPrefixedData(conn, handshakeData); err != nil {
+	if err := writeLengthPrefixedData(conn, obfuscatedData); err != nil {
 		conn.SetWriteDeadline(time.Time{})
 		return fmt.Errorf("send handshake: %w", err)
 	}
@@ -386,15 +452,21 @@ func (c *SmuxClient) performHandshake(conn net.Conn, token, ruleID string) error
 	}
 	conn.SetReadDeadline(time.Time{})
 
+	// Deobfuscate result
+	deobfuscatedResult, err := DeobfuscateHandshake(resultData)
+	if err != nil {
+		return fmt.Errorf("deobfuscate handshake result: %w", err)
+	}
+
 	var result forward.TunnelHandshakeResult
-	if err := json.Unmarshal(resultData, &result); err != nil {
+	if err := json.Unmarshal(deobfuscatedResult, &result); err != nil {
 		return fmt.Errorf("unmarshal handshake result: %w", err)
 	}
 	if !result.Success {
 		return fmt.Errorf("handshake failed: %s", result.Error)
 	}
 
-	logger.Info("smux tunnel handshake successful", "entry_agent_id", result.EntryAgentID)
+	logger.Info("smux tunnel handshake successful via tls", "entry_agent_id", result.EntryAgentID)
 	return nil
 }
 

@@ -136,7 +136,11 @@ func (c *TLSClient) connect() error {
 		tlsConn.Close()
 		return fmt.Errorf("marshal handshake: %w", err)
 	}
-	if err := writeLengthPrefixedData(tlsConn, handshakeData); err != nil {
+
+	// Obfuscate handshake data (XOR + random padding)
+	obfuscatedData := ObfuscateHandshake(handshakeData)
+
+	if err := writeLengthPrefixedData(tlsConn, obfuscatedData); err != nil {
 		tlsConn.Close()
 		return fmt.Errorf("send handshake: %w", err)
 	}
@@ -150,8 +154,15 @@ func (c *TLSClient) connect() error {
 	}
 	tlsConn.SetReadDeadline(time.Time{}) // Clear deadline
 
+	// Deobfuscate result
+	deobfuscatedResult, err := DeobfuscateHandshake(resultData)
+	if err != nil {
+		tlsConn.Close()
+		return fmt.Errorf("deobfuscate handshake result: %w", err)
+	}
+
 	var result forward.TunnelHandshakeResult
-	if err := json.Unmarshal(resultData, &result); err != nil {
+	if err := json.Unmarshal(deobfuscatedResult, &result); err != nil {
 		tlsConn.Close()
 		return fmt.Errorf("unmarshal handshake result: %w", err)
 	}
