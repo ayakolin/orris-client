@@ -186,89 +186,108 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Entry role: establish tunnel to exit agent
-			var ef *forwarder.EntryForwarder
-
-			// If NextHopAddress is already provided, use it directly (single tunnel)
-			if rule.NextHopAddress != "" {
-				t, err := a.getOrCreateTunnelByAddress(rule)
+			// Check if using SMUX multiplexing
+			if rule.TunnelType.IsSmux() {
+				smuxF, err := a.startSmuxEntryForwarder(rule)
 				if err != nil {
-					errMsg := fmt.Errorf("create tunnel: %w", err)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-					return errMsg
+					return err
 				}
-				ef = forwarder.NewEntryForwarder(rule, t)
-				t.SetHandler(ef)
-			} else if len(rule.ExitAgents) > 1 {
-				// Multiple exit agents: use load balancing mode
-				tunnels, weights, err := a.getOrCreateTunnels(rule)
-				if err != nil {
-					errMsg := fmt.Errorf("create tunnels for load balancing: %w", err)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-					return errMsg
-				}
-				// Get health check config for load balancing failover
-				healthConfig := a.getHealthCheckConfig(rule.ID)
-				// Extract exit agent IDs for health reporting
-				exitAgentIDs := make([]string, len(rule.ExitAgents))
-				for i, ea := range rule.ExitAgents {
-					exitAgentIDs[i] = ea.AgentID
-				}
-				ef = forwarder.NewEntryForwarderWithTunnels(rule, tunnels, weights, healthConfig, exitAgentIDs)
-				// Set health change callback to report to server
-				ef.SetHealthChangeCallback(a.createHealthChangeCallback())
-				// Set handler on all tunnels
-				for _, t := range tunnels {
-					t.SetHandler(ef)
-				}
-				// Store tunnels for cleanup (use rule ID with suffix for multi-tunnel)
-				a.storeMultiTunnels(rule.ID, tunnels)
-				logger.Info("entry forwarder using load balancing",
-					"rule_id", rule.ID,
-					"tunnel_count", len(tunnels),
-					"strategy", string(rule.LoadBalanceStrategy),
-					"health_check_enabled", healthConfig != nil)
-			} else if rule.NextHopAgentID != "" || rule.ExitAgentID != "" || len(rule.ExitAgents) == 1 {
-				// Single exit agent mode
-				t, err := a.getOrCreateTunnel(rule)
-				if err != nil {
-					errMsg := fmt.Errorf("create tunnel: %w", err)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-					return errMsg
-				}
-				ef = forwarder.NewEntryForwarder(rule, t)
-				t.SetHandler(ef)
+				f = smuxF
 			} else {
-				err := fmt.Errorf("entry rule missing next hop info")
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
-			}
+				// Non-SMUX mode: use original message-based tunnel
+				var ef *forwarder.EntryForwarder
 
-			if err := ef.Start(a.ctx); err != nil {
-				// Cleanup: stop tunnels on forwarder start failure
-				a.cleanupTunnelsForRule(rule.ID)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
+				// If NextHopAddress is already provided, use it directly (single tunnel)
+				if rule.NextHopAddress != "" {
+					t, err := a.getOrCreateTunnelByAddress(rule)
+					if err != nil {
+						errMsg := fmt.Errorf("create tunnel: %w", err)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+						return errMsg
+					}
+					ef = forwarder.NewEntryForwarder(rule, t)
+					t.SetHandler(ef)
+				} else if len(rule.ExitAgents) > 1 {
+					// Multiple exit agents: use load balancing mode
+					tunnels, weights, err := a.getOrCreateTunnels(rule)
+					if err != nil {
+						errMsg := fmt.Errorf("create tunnels for load balancing: %w", err)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+						return errMsg
+					}
+					// Get health check config for load balancing failover
+					healthConfig := a.getHealthCheckConfig(rule.ID)
+					// Extract exit agent IDs for health reporting
+					exitAgentIDs := make([]string, len(rule.ExitAgents))
+					for i, ea := range rule.ExitAgents {
+						exitAgentIDs[i] = ea.AgentID
+					}
+					ef = forwarder.NewEntryForwarderWithTunnels(rule, tunnels, weights, healthConfig, exitAgentIDs)
+					// Set health change callback to report to server
+					ef.SetHealthChangeCallback(a.createHealthChangeCallback())
+					// Set handler on all tunnels
+					for _, t := range tunnels {
+						t.SetHandler(ef)
+					}
+					// Store tunnels for cleanup (use rule ID with suffix for multi-tunnel)
+					a.storeMultiTunnels(rule.ID, tunnels)
+					logger.Info("entry forwarder using load balancing",
+						"rule_id", rule.ID,
+						"tunnel_count", len(tunnels),
+						"strategy", string(rule.LoadBalanceStrategy),
+						"health_check_enabled", healthConfig != nil)
+				} else if rule.NextHopAgentID != "" || rule.ExitAgentID != "" || len(rule.ExitAgents) == 1 {
+					// Single exit agent mode
+					t, err := a.getOrCreateTunnel(rule)
+					if err != nil {
+						errMsg := fmt.Errorf("create tunnel: %w", err)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+						return errMsg
+					}
+					ef = forwarder.NewEntryForwarder(rule, t)
+					t.SetHandler(ef)
+				} else {
+					err := fmt.Errorf("entry rule missing next hop info")
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+
+				if err := ef.Start(a.ctx); err != nil {
+					// Cleanup: stop tunnels on forwarder start failure
+					a.cleanupTunnelsForRule(rule.ID)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = ef
 			}
-			f = ef
 
 		case "exit":
 			// Exit role: accept tunnel connections and forward to target
-			// Start the appropriate tunnel server based on TunnelType
-			if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
-			}
+			// Check if using SMUX multiplexing
+			if rule.TunnelType.IsSmux() {
+				smuxF, err := a.startSmuxExitForwarder(rule)
+				if err != nil {
+					return err
+				}
+				f = smuxF
+			} else {
+				// Non-SMUX mode: use original message-based tunnel server
+				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
 
-			ef := forwarder.NewExitForwarder(rule)
-			server := a.getTunnelServer(rule.TunnelType)
-			server.AddHandler(rule.ID, ef)
-			if err := ef.Start(a.ctx); err != nil {
-				// Cleanup: remove handler on forwarder start failure
-				server.RemoveHandler(rule.ID)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
+				ef := forwarder.NewExitForwarder(rule)
+				server := a.getTunnelServer(rule.TunnelType)
+				server.AddHandler(rule.ID, ef)
+				if err := ef.Start(a.ctx); err != nil {
+					// Cleanup: remove handler on forwarder start failure
+					server.RemoveHandler(rule.ID)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = ef
 			}
-			f = ef
 
 		default:
 			err := fmt.Errorf("unknown role %q for entry rule", rule.Role)
@@ -281,24 +300,33 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Chain entry: connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule)
-			if err != nil {
-				errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-				return errMsg
-			}
-
-			ef := forwarder.NewEntryForwarder(rule, t)
-			t.SetHandler(ef)
-			if err := ef.Start(a.ctx); err != nil {
-				// Cleanup: stop tunnel on forwarder start failure
-				if stopErr := t.Stop(); stopErr != nil {
-					logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+			// Check if using SMUX multiplexing
+			if rule.TunnelType.IsSmux() {
+				smuxF, err := a.startSmuxChainEntryForwarder(rule)
+				if err != nil {
+					return err
 				}
-				a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-				return err
+				f = smuxF
+			} else {
+				t, err := a.getOrCreateTunnelByAddress(rule)
+				if err != nil {
+					errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+					return errMsg
+				}
+
+				ef := forwarder.NewEntryForwarder(rule, t)
+				t.SetHandler(ef)
+				if err := ef.Start(a.ctx); err != nil {
+					// Cleanup: stop tunnel on forwarder start failure
+					if stopErr := t.Stop(); stopErr != nil {
+						logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+					}
+					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+					return err
+				}
+				f = ef
 			}
-			f = ef
 
 		case "relay":
 			// Chain relay: accept from previous hop, forward to next hop
@@ -326,49 +354,67 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				f = dcf
 			} else if rule.HopMode == "boundary" && rule.OutboundMode == "direct" {
 				// Boundary relay: tunnel inbound -> direct outbound
-				logger.Info("using boundary relay forwarder", "rule_id", rule.ID)
-				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
-				}
-				server := a.getTunnelServer(rule.TunnelType)
+				// Check if using SMUX multiplexing
+				if rule.TunnelType.IsSmux() {
+					smuxF, err := a.startSmuxBoundaryRelayForwarder(rule)
+					if err != nil {
+						return err
+					}
+					f = smuxF
+				} else {
+					logger.Info("using boundary relay forwarder", "rule_id", rule.ID)
+					if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
+					server := a.getTunnelServer(rule.TunnelType)
 
-				brf := forwarder.NewBoundaryRelayForwarder(rule)
-				server.AddHandler(rule.ID, brf)
-				if err := brf.Start(a.ctx); err != nil {
-					server.RemoveHandler(rule.ID)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
+					brf := forwarder.NewBoundaryRelayForwarder(rule)
+					server.AddHandler(rule.ID, brf)
+					if err := brf.Start(a.ctx); err != nil {
+						server.RemoveHandler(rule.ID)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
+					f = brf
 				}
-				f = brf
 			} else {
 				// Normal relay: tunnel inbound -> tunnel outbound
-				logger.Info("using tunnel relay forwarder", "rule_id", rule.ID)
-				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
-				}
-				server := a.getTunnelServer(rule.TunnelType)
-
-				t, err := a.getOrCreateTunnelByAddress(rule)
-				if err != nil {
-					errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
-					return errMsg
-				}
-
-				rf := forwarder.NewRelayForwarder(rule, t)
-				server.AddHandler(rule.ID, rf)
-				if err := rf.Start(a.ctx); err != nil {
-					// Cleanup: stop tunnel and remove handler on forwarder start failure
-					if stopErr := t.Stop(); stopErr != nil {
-						logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+				// Check if using SMUX multiplexing
+				if rule.TunnelType.IsSmux() {
+					smuxF, err := a.startSmuxRelayForwarder(rule)
+					if err != nil {
+						return err
 					}
-					server.RemoveHandler(rule.ID)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
+					f = smuxF
+				} else {
+					logger.Info("using tunnel relay forwarder", "rule_id", rule.ID)
+					if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
+					server := a.getTunnelServer(rule.TunnelType)
+
+					t, err := a.getOrCreateTunnelByAddress(rule)
+					if err != nil {
+						errMsg := fmt.Errorf("create tunnel to next hop: %w", err)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+						return errMsg
+					}
+
+					rf := forwarder.NewRelayForwarder(rule, t)
+					server.AddHandler(rule.ID, rf)
+					if err := rf.Start(a.ctx); err != nil {
+						// Cleanup: stop tunnel and remove handler on forwarder start failure
+						if stopErr := t.Stop(); stopErr != nil {
+							logger.Error("failed to stop tunnel after forwarder start failure", "rule_id", rule.ID, "error", stopErr)
+						}
+						server.RemoveHandler(rule.ID)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
+					f = rf
 				}
-				f = rf
 			}
 
 		case "exit":
@@ -397,22 +443,31 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 				f = dcf
 			} else {
 				// Normal exit: tunnel inbound -> target
-				logger.Info("using tunnel exit forwarder", "rule_id", rule.ID)
-				if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
-				}
+				// Check if using SMUX multiplexing
+				if rule.TunnelType.IsSmux() {
+					smuxF, err := a.startSmuxExitForwarder(rule)
+					if err != nil {
+						return err
+					}
+					f = smuxF
+				} else {
+					logger.Info("using tunnel exit forwarder", "rule_id", rule.ID)
+					if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
 
-				ef := forwarder.NewExitForwarder(rule)
-				server := a.getTunnelServer(rule.TunnelType)
-				server.AddHandler(rule.ID, ef)
-				if err := ef.Start(a.ctx); err != nil {
-					// Cleanup: remove handler on forwarder start failure
-					server.RemoveHandler(rule.ID)
-					a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
-					return err
+					ef := forwarder.NewExitForwarder(rule)
+					server := a.getTunnelServer(rule.TunnelType)
+					server.AddHandler(rule.ID, ef)
+					if err := ef.Start(a.ctx); err != nil {
+						// Cleanup: remove handler on forwarder start failure
+						server.RemoveHandler(rule.ID)
+						a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+						return err
+					}
+					f = ef
 				}
-				f = ef
 			}
 
 		default:
@@ -512,6 +567,7 @@ func (a *Agent) stopAll() {
 	a.forwardersMu.Unlock()
 
 	// Stop tunnel servers (no lock needed)
+	// Note: SMUX support is now integrated into these servers
 	if a.tunnelServer != nil {
 		a.tunnelServer.Stop()
 		a.tunnelServer = nil
@@ -554,7 +610,7 @@ func (a *Agent) updateRulesList(data *forward.ConfigSyncData) {
 		a.rules = append(a.rules, *rule)
 	}
 
-	// Update tunnel servers
+	// Update tunnel servers (SMUX support is integrated)
 	if a.tunnelServer != nil {
 		a.tunnelServer.UpdateRules(a.rules)
 	}
@@ -592,4 +648,158 @@ func (a *Agent) createHealthChangeCallback() forwarder.HealthChangeCallback {
 				"fail_count", report.FailCount)
 		}
 	}
+}
+
+// startSmuxEntryForwarder starts a SMUX-based entry forwarder.
+func (a *Agent) startSmuxEntryForwarder(rule *forward.Rule) (forwarder.Forwarder, error) {
+	// Create SMUX client
+	smuxClient, err := a.getOrCreateSmuxClient(rule)
+	if err != nil {
+		errMsg := fmt.Errorf("create smux client: %w", err)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+		return nil, errMsg
+	}
+
+	// Create SMUX entry forwarder
+	ef := forwarder.NewSmuxEntryForwarder(rule, smuxClient)
+	if err := ef.Start(a.ctx); err != nil {
+		// Cleanup: stop SMUX client on forwarder start failure
+		smuxClient.Stop()
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	logger.Info("smux entry forwarder started",
+		"rule_id", rule.ID,
+		"tunnel_type", rule.TunnelType)
+
+	return ef, nil
+}
+
+// startSmuxExitForwarder starts a SMUX-based exit forwarder.
+func (a *Agent) startSmuxExitForwarder(rule *forward.Rule) (forwarder.Forwarder, error) {
+	// Ensure tunnel server is started (SMUX support is integrated)
+	if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	// Create SMUX exit forwarder
+	ef := forwarder.NewSmuxExitForwarder(rule)
+
+	// Register SMUX stream handler with tunnel server
+	server := a.getTunnelServer(rule.TunnelType)
+	server.SetSmuxHandler(rule.ID, ef)
+
+	if err := ef.Start(a.ctx); err != nil {
+		// Cleanup: remove handler on forwarder start failure
+		server.RemoveSmuxHandler(rule.ID)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	logger.Info("smux exit forwarder started",
+		"rule_id", rule.ID,
+		"tunnel_type", rule.TunnelType)
+
+	return ef, nil
+}
+
+// startSmuxChainEntryForwarder starts a SMUX-based chain entry forwarder.
+// Uses NextHopAddress to create the SMUX client.
+func (a *Agent) startSmuxChainEntryForwarder(rule *forward.Rule) (forwarder.Forwarder, error) {
+	// Create SMUX client using next hop address
+	smuxClient, err := a.createSmuxClientByAddress(rule)
+	if err != nil {
+		errMsg := fmt.Errorf("create smux client to next hop: %w", err)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+		return nil, errMsg
+	}
+
+	// Create SMUX entry forwarder
+	ef := forwarder.NewSmuxEntryForwarder(rule, smuxClient)
+	if err := ef.Start(a.ctx); err != nil {
+		// Cleanup: stop SMUX client on forwarder start failure
+		smuxClient.Stop()
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	logger.Info("smux chain entry forwarder started",
+		"rule_id", rule.ID,
+		"tunnel_type", rule.TunnelType,
+		"next_hop", fmt.Sprintf("%s:%d", rule.NextHopAddress, rule.NextHopWsPort))
+
+	return ef, nil
+}
+
+// startSmuxRelayForwarder starts a SMUX-based relay forwarder.
+// Accepts incoming streams from SMUX server and forwards to next hop via SMUX client.
+func (a *Agent) startSmuxRelayForwarder(rule *forward.Rule) (forwarder.Forwarder, error) {
+	// Ensure tunnel server is started for incoming connections (SMUX support is integrated)
+	if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	// Create SMUX client for outgoing connections to next hop
+	smuxClient, err := a.createSmuxClientByAddress(rule)
+	if err != nil {
+		errMsg := fmt.Errorf("create smux client to next hop: %w", err)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, errMsg.Error())
+		return nil, errMsg
+	}
+
+	// Create SMUX relay forwarder
+	rf := forwarder.NewSmuxRelayForwarder(rule, smuxClient)
+
+	// Register SMUX stream handler with tunnel server
+	server := a.getTunnelServer(rule.TunnelType)
+	server.SetSmuxHandler(rule.ID, rf)
+
+	if err := rf.Start(a.ctx); err != nil {
+		// Cleanup: stop client and remove handler on forwarder start failure
+		smuxClient.Stop()
+		server.RemoveSmuxHandler(rule.ID)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	logger.Info("smux relay forwarder started",
+		"rule_id", rule.ID,
+		"tunnel_type", rule.TunnelType,
+		"next_hop", fmt.Sprintf("%s:%d", rule.NextHopAddress, rule.NextHopWsPort))
+
+	return rf, nil
+}
+
+// startSmuxBoundaryRelayForwarder starts a SMUX-based boundary relay forwarder.
+// Accepts incoming streams from SMUX server and forwards to next hop via direct TCP.
+func (a *Agent) startSmuxBoundaryRelayForwarder(rule *forward.Rule) (forwarder.Forwarder, error) {
+	// Ensure tunnel server is started for incoming connections (SMUX support is integrated)
+	if err := a.ensureTunnelServerByType(rule.TunnelType); err != nil {
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	// Create SMUX boundary relay forwarder
+	brf := forwarder.NewSmuxBoundaryRelayForwarder(rule)
+
+	// Register SMUX stream handler with tunnel server
+	server := a.getTunnelServer(rule.TunnelType)
+	server.SetSmuxHandler(rule.ID, brf)
+
+	if err := brf.Start(a.ctx); err != nil {
+		// Cleanup: remove handler on forwarder start failure
+		server.RemoveSmuxHandler(rule.ID)
+		a.setRuleStatus(rule.ID, forward.SyncStatusFailed, forward.RunStatusError, err.Error())
+		return nil, err
+	}
+
+	logger.Info("smux boundary relay forwarder started",
+		"rule_id", rule.ID,
+		"tunnel_type", rule.TunnelType,
+		"next_hop", fmt.Sprintf("%s:%d", rule.NextHopAddress, rule.NextHopPort))
+
+	return brf, nil
 }

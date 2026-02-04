@@ -443,3 +443,150 @@ func (a *Agent) getTunnelServer(tunnelType forward.TunnelType) tunnel.TunnelServ
 	}
 	return a.tunnelServer
 }
+
+// createSmuxClient creates a SMUX tunnel client.
+// For tls_smux: endpoint is "host:port"
+// For ws_smux: endpoint is "wss://host:port/tunnel"
+func (a *Agent) createSmuxClient(rule *forward.Rule, address string, port uint16, agentID string) (*tunnel.SmuxClient, error) {
+	useTLS := rule.TunnelType.IsTLSSmux()
+
+	var endpoint string
+	if useTLS {
+		endpoint = net.JoinHostPort(address, fmt.Sprintf("%d", port))
+	} else {
+		endpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
+	}
+
+	// Create endpoint refresher
+	refresher := func() (string, string, error) {
+		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
+		if err != nil {
+			return "", "", err
+		}
+		var newEndpoint string
+		if useTLS {
+			newEndpoint = net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.TlsPort))
+		} else {
+			newEndpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
+		}
+		return newEndpoint, a.getHandshakeToken(), nil
+	}
+
+	opts := []tunnel.SmuxClientOption{
+		tunnel.WithSmuxEndpointRefresher(refresher, 3),
+		tunnel.WithSmuxInitialRetry(6),
+	}
+
+	client := tunnel.NewSmuxClient(endpoint, a.getHandshakeToken(), rule.ID, useTLS, opts...)
+
+	if err := client.Start(a.ctx); err != nil {
+		return nil, fmt.Errorf("start smux tunnel: %w", err)
+	}
+
+	return client, nil
+}
+
+// getOrCreateSmuxClient creates a SMUX client for the rule.
+func (a *Agent) getOrCreateSmuxClient(rule *forward.Rule) (tunnel.SmuxTunnelClient, error) {
+	// Get the exit agent ID
+	agentID := rule.NextHopAgentID
+	if agentID == "" {
+		agentID = rule.ExitAgentID
+	}
+	if agentID == "" && len(rule.ExitAgents) > 0 {
+		agentID = rule.ExitAgents[0].AgentID
+	}
+	if agentID == "" {
+		return nil, fmt.Errorf("no exit agent ID specified")
+	}
+
+	endpoint, err := a.client.GetExitEndpoint(a.ctx, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("get exit endpoint: %w", err)
+	}
+
+	// Use TLS port for tls_smux, WS port for ws_smux
+	port := endpoint.WsPort
+	if rule.TunnelType.IsTLSSmux() {
+		port = endpoint.TlsPort
+	}
+
+	return a.createSmuxClient(rule, endpoint.Address, port, agentID)
+}
+
+// ensureTunnelServerByType now handles both regular tunnels and SMUX tunnels.
+// For SMUX tunnel types (ws_smux, tls_smux), it uses the same server as regular tunnels
+// since SMUX support is now integrated into Server and TLSServer.
+// The EnableSmux field in handshake distinguishes between the two protocols.
+
+// createSmuxClientByAddress creates a SMUX client using explicit NextHopAddress from rule.
+// Used for chain rules where the next hop address is explicitly provided.
+func (a *Agent) createSmuxClientByAddress(rule *forward.Rule) (*tunnel.SmuxClient, error) {
+	useTLS := rule.TunnelType.IsTLSSmux()
+
+	var endpoint string
+	var port uint16
+	if useTLS {
+		port = rule.NextHopTlsPort
+		endpoint = net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", port))
+	} else {
+		port = rule.NextHopWsPort
+		endpoint = fmt.Sprintf("wss://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", port)))
+	}
+
+	// Use NextHopConnectionToken if available, otherwise fall back to handshake token
+	token := rule.NextHopConnectionToken
+	if token == "" {
+		logger.Debug("NextHopConnectionToken empty for smux, falling back to handshake token",
+			"rule_id", rule.ID, "rule_type", rule.RuleType, "role", rule.Role)
+		token = a.getHandshakeToken()
+	} else {
+		logger.Debug("using NextHopConnectionToken for smux",
+			"rule_id", rule.ID, "token_prefix", tokenPrefix(token))
+	}
+
+	// Create endpoint refresher for chain rules
+	ruleID := rule.ID
+	refresher := func() (string, string, error) {
+		refreshedRule, err := a.client.RefreshRule(a.ctx, ruleID)
+		if err != nil {
+			return "", "", fmt.Errorf("refresh rule: %w", err)
+		}
+
+		// Update local rule cache
+		a.updateRuleCache(refreshedRule)
+
+		var newEndpoint string
+		if useTLS {
+			newEndpoint = net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopTlsPort))
+		} else {
+			newEndpoint = fmt.Sprintf("wss://%s/tunnel",
+				net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopWsPort)))
+		}
+
+		// Use refreshed token if available
+		newToken := refreshedRule.NextHopConnectionToken
+		if newToken == "" {
+			newToken = a.getHandshakeToken()
+		}
+
+		logger.Info("smux endpoint refreshed for chain rule",
+			"rule_id", ruleID,
+			"new_endpoint", newEndpoint)
+
+		return newEndpoint, newToken, nil
+	}
+
+	opts := []tunnel.SmuxClientOption{
+		tunnel.WithSmuxEndpointRefresher(refresher, 3),
+		tunnel.WithSmuxInitialRetry(6),
+	}
+
+	client := tunnel.NewSmuxClient(endpoint, token, rule.ID, useTLS, opts...)
+
+	if err := client.Start(a.ctx); err != nil {
+		return nil, fmt.Errorf("start smux tunnel: %w", err)
+	}
+
+	return client, nil
+}

@@ -11,12 +11,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtaci/smux"
+
 	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
 )
 
 // TLSServer is a TLS tunnel server for Exit agents.
 // It accepts connections from Entry agents and forwards data to targets.
+// Supports both message-based protocol (tls) and SMUX multiplexing (tls_smux).
 type TLSServer struct {
 	port   uint16
 	client *forward.Client // API client for handshake verification
@@ -35,6 +38,15 @@ type TLSServer struct {
 	connHandler map[net.Conn]MessageHandler // per-connection handler (by ruleID)
 	connRuleID  map[net.Conn]string         // per-connection ruleID
 
+	// SMUX support for tls_smux tunnel type
+	smuxHandlerMu sync.RWMutex
+	smuxHandlers  map[string]SmuxStreamHandler // ruleID -> SMUX stream handler
+
+	smuxSessionMu sync.RWMutex
+	smuxSessions  map[*smux.Session]string // session -> ruleID
+
+	smuxConfig *SmuxConfig
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -43,14 +55,17 @@ type TLSServer struct {
 // NewTLSServer creates a new TLS tunnel server.
 func NewTLSServer(port uint16, client *forward.Client, rules []forward.Rule) *TLSServer {
 	return &TLSServer{
-		port:        port,
-		client:      client,
-		rules:       rules,
-		handlers:    make(map[string]MessageHandler),
-		conns:       make(map[net.Conn]struct{}),
-		connLock:    make(map[net.Conn]*sync.Mutex),
-		connHandler: make(map[net.Conn]MessageHandler),
-		connRuleID:  make(map[net.Conn]string),
+		port:         port,
+		client:       client,
+		rules:        rules,
+		handlers:     make(map[string]MessageHandler),
+		conns:        make(map[net.Conn]struct{}),
+		connLock:     make(map[net.Conn]*sync.Mutex),
+		connHandler:  make(map[net.Conn]MessageHandler),
+		connRuleID:   make(map[net.Conn]string),
+		smuxHandlers: make(map[string]SmuxStreamHandler),
+		smuxSessions: make(map[*smux.Session]string),
+		smuxConfig:   DefaultSmuxConfig(),
 	}
 }
 
@@ -97,6 +112,27 @@ func (s *TLSServer) RemoveHandler(ruleID string) {
 	s.handlerMu.Lock()
 	delete(s.handlers, ruleID)
 	s.handlerMu.Unlock()
+}
+
+// SetSmuxHandler sets the SMUX stream handler for a rule.
+func (s *TLSServer) SetSmuxHandler(ruleID string, handler SmuxStreamHandler) {
+	s.smuxHandlerMu.Lock()
+	oldHandler := s.smuxHandlers[ruleID]
+	s.smuxHandlers[ruleID] = handler
+	s.smuxHandlerMu.Unlock()
+
+	// Notify old handler if exists
+	if oldHandler != nil {
+		oldHandler.OnSessionClose()
+		logger.Info("updated smux stream handler for rule", "rule_id", ruleID)
+	}
+}
+
+// RemoveSmuxHandler removes the SMUX stream handler for a rule.
+func (s *TLSServer) RemoveSmuxHandler(ruleID string) {
+	s.smuxHandlerMu.Lock()
+	delete(s.smuxHandlers, ruleID)
+	s.smuxHandlerMu.Unlock()
 }
 
 // Start starts the TLS tunnel server.
@@ -146,6 +182,7 @@ func (s *TLSServer) Stop() error {
 		s.cancel()
 	}
 
+	// Close all message-based connections
 	s.connMu.Lock()
 	for conn, mu := range s.connLock {
 		// Hold write lock before closing to prevent concurrent write
@@ -158,6 +195,14 @@ func (s *TLSServer) Stop() error {
 	s.connHandler = make(map[net.Conn]MessageHandler)
 	s.connRuleID = make(map[net.Conn]string)
 	s.connMu.Unlock()
+
+	// Close all SMUX sessions
+	s.smuxSessionMu.Lock()
+	for session := range s.smuxSessions {
+		session.Close()
+	}
+	s.smuxSessions = make(map[*smux.Session]string)
+	s.smuxSessionMu.Unlock()
 
 	if s.listener != nil {
 		s.listener.Close()
@@ -200,7 +245,7 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	writeMu := &sync.Mutex{}
 
 	// Perform handshake
-	ruleID, isProbe, err := s.performHandshake(conn, writeMu)
+	ruleID, isProbe, enableSmux, err := s.performHandshake(conn, writeMu)
 	if err != nil {
 		logger.Error("tls tunnel handshake failed", "remote", remoteAddr, "error", err)
 		conn.Close()
@@ -218,6 +263,12 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 			logger.Info("probe connection closed via tls", "remote", remoteAddr, "rule_id", ruleID)
 		}()
 		s.probeReadLoop(conn, sender)
+		return
+	}
+
+	// Handle SMUX connections
+	if enableSmux {
+		s.handleSmuxConnection(conn, ruleID, remoteAddr)
 		return
 	}
 
@@ -307,21 +358,22 @@ func (s *TLSServer) handleConnection(conn net.Conn) {
 	s.readLoop(conn, sender)
 }
 
-func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, err error) {
+func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, enableSmux bool, err error) {
 	// Set read deadline for handshake
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 
 	// Read handshake message (length-prefixed JSON)
-	reader := bufio.NewReader(conn)
-	handshakeData, err := readLengthPrefixedData(reader)
+	// Note: We read directly from conn to avoid bufio.Reader pre-reading data
+	// that would be lost when SMUX session takes over the connection.
+	handshakeData, err := readLengthPrefixedData(conn)
 	if err != nil {
-		return "", false, fmt.Errorf("read handshake: %w", err)
+		return "", false, false, fmt.Errorf("read handshake: %w", err)
 	}
 
 	var handshake forward.TunnelHandshake
 	if err := json.Unmarshal(handshakeData, &handshake); err != nil {
-		return "", false, fmt.Errorf("unmarshal handshake: %w", err)
+		return "", false, false, fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
 	// Log received token info for debugging
@@ -329,7 +381,7 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID
 	if len(tokenDbg) > 15 {
 		tokenDbg = tokenDbg[:15] + "..."
 	}
-	logger.Debug("received tls tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe)
+	logger.Debug("received tls tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe, "enable_smux", handshake.EnableSmux)
 
 	// Verify handshake via server API with timeout
 	logger.Debug("verifying tls handshake via server API", "rule_id", handshake.RuleID)
@@ -347,23 +399,23 @@ func (s *TLSServer) performHandshake(conn net.Conn, writeMu *sync.Mutex) (ruleID
 		writeMu.Lock()
 		writeLengthPrefixedData(conn, resultData)
 		writeMu.Unlock()
-		return "", false, fmt.Errorf("verify handshake via server: %w", err)
+		return "", false, false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
 	// Send success result
 	resultData, err := json.Marshal(result)
 	if err != nil {
-		return "", false, fmt.Errorf("marshal result: %w", err)
+		return "", false, false, fmt.Errorf("marshal result: %w", err)
 	}
 	writeMu.Lock()
 	err = writeLengthPrefixedData(conn, resultData)
 	writeMu.Unlock()
 	if err != nil {
-		return "", false, fmt.Errorf("send result: %w", err)
+		return "", false, false, fmt.Errorf("send result: %w", err)
 	}
 
-	logger.Info("tls tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe)
-	return handshake.RuleID, handshake.IsProbe, nil
+	logger.Info("tls tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe, "enable_smux", handshake.EnableSmux)
+	return handshake.RuleID, handshake.IsProbe, handshake.EnableSmux, nil
 }
 
 func (s *TLSServer) readLoop(conn net.Conn, sender *tlsConnSender) {
@@ -465,4 +517,87 @@ func (s *tlsConnSender) SendMessage(msg *Message) error {
 	}
 
 	return nil
+}
+
+// handleSmuxConnection handles a TLS connection with SMUX multiplexing.
+func (s *TLSServer) handleSmuxConnection(conn net.Conn, ruleID, remoteAddr string) {
+	// Create SMUX session as server
+	session, err := smux.Server(conn, s.smuxConfig.ToSmuxConfig())
+	if err != nil {
+		logger.Error("create smux session failed", "remote", remoteAddr, "error", err)
+		conn.Close()
+		return
+	}
+
+	// Register session
+	s.smuxSessionMu.Lock()
+	s.smuxSessions[session] = ruleID
+	s.smuxSessionMu.Unlock()
+
+	logger.Info("smux session established via tls", "remote", remoteAddr, "rule_id", ruleID)
+
+	defer func() {
+		// Unregister and close session
+		s.smuxSessionMu.Lock()
+		delete(s.smuxSessions, session)
+		s.smuxSessionMu.Unlock()
+
+		session.Close()
+
+		// Notify handler
+		s.smuxHandlerMu.RLock()
+		handler := s.smuxHandlers[ruleID]
+		s.smuxHandlerMu.RUnlock()
+		if handler != nil {
+			handler.OnSessionClose()
+		}
+
+		logger.Info("smux session closed via tls", "remote", remoteAddr, "rule_id", ruleID)
+	}()
+
+	s.acceptSmuxStreams(session, ruleID, remoteAddr)
+}
+
+// acceptSmuxStreams accepts and handles streams from a SMUX session.
+func (s *TLSServer) acceptSmuxStreams(session *smux.Session, ruleID, remoteAddr string) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := session.AcceptStream()
+		if err != nil {
+			// Normal closure conditions - don't log as error
+			if s.ctx.Err() != nil || session.IsClosed() {
+				return
+			}
+			// EOF is normal when client closes the session
+			if err == io.EOF || err.Error() == "EOF" {
+				logger.Debug("smux session closed by client", "remote", remoteAddr)
+				return
+			}
+			logger.Error("smux accept stream error", "remote", remoteAddr, "error", err)
+			return
+		}
+
+		// Get handler for this rule
+		s.smuxHandlerMu.RLock()
+		handler := s.smuxHandlers[ruleID]
+		s.smuxHandlerMu.RUnlock()
+
+		if handler == nil {
+			logger.Warn("no smux handler for stream", "rule_id", ruleID)
+			stream.Close()
+			continue
+		}
+
+		// Handle stream in a goroutine
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			handler.HandleStream(stream)
+		}()
+	}
 }

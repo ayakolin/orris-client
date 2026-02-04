@@ -65,7 +65,12 @@ type Agent struct {
 	tunnelServer      *tunnel.Server
 	tlsTunnelServerMu sync.Mutex // protects tlsTunnelServer initialization
 	tlsTunnelServer   *tunnel.TLSServer
-	configVersion     uint64 // current config version from server
+
+	// Note: SMUX support is integrated into tunnelServer and tlsTunnelServer.
+	// They now support both message-based protocol and SMUX multiplexing on the same port,
+	// distinguished by EnableSmux field in the handshake message.
+
+	configVersion uint64 // current config version from server
 
 	hubConnMu sync.RWMutex     // protects hubConn access
 	hubConn   *forward.HubConn // current hub WebSocket connection

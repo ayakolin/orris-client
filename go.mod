@@ -9,6 +9,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/prometheus/procfs v0.19.2
 	github.com/refraction-networking/utls v1.8.2
+	github.com/xtaci/smux v1.5.34
 )
 
 require (

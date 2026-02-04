@@ -6,14 +6,16 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/orris-inc/orris-client/internal/forward"
+	"github.com/xtaci/smux"
 
+	"github.com/orris-inc/orris-client/internal/forward"
 	"github.com/orris-inc/orris-client/internal/logger"
 )
 
@@ -35,6 +37,7 @@ type Sender interface {
 
 // Server is a WebSocket tunnel server for Exit agents.
 // It accepts connections from Entry agents and forwards data to targets.
+// Supports both message-based protocol (ws) and SMUX multiplexing (ws_smux).
 type Server struct {
 	port   uint16
 	client *forward.Client // API client for handshake verification
@@ -55,6 +58,15 @@ type Server struct {
 	connHandler map[*websocket.Conn]MessageHandler // per-connection handler (by ruleID)
 	connRuleID  map[*websocket.Conn]string         // per-connection ruleID
 
+	// SMUX support for ws_smux tunnel type
+	smuxHandlerMu sync.RWMutex
+	smuxHandlers  map[string]SmuxStreamHandler // ruleID -> SMUX stream handler
+
+	smuxSessionMu sync.RWMutex
+	smuxSessions  map[*smux.Session]string // session -> ruleID
+
+	smuxConfig *SmuxConfig
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -63,14 +75,17 @@ type Server struct {
 // NewServer creates a new tunnel server.
 func NewServer(port uint16, client *forward.Client, rules []forward.Rule) *Server {
 	return &Server{
-		port:        port,
-		client:      client,
-		rules:       rules,
-		handlers:    make(map[string]MessageHandler),
-		conns:       make(map[*websocket.Conn]struct{}),
-		connLock:    make(map[*websocket.Conn]*sync.Mutex),
-		connHandler: make(map[*websocket.Conn]MessageHandler),
-		connRuleID:  make(map[*websocket.Conn]string),
+		port:         port,
+		client:       client,
+		rules:        rules,
+		handlers:     make(map[string]MessageHandler),
+		conns:        make(map[*websocket.Conn]struct{}),
+		connLock:     make(map[*websocket.Conn]*sync.Mutex),
+		connHandler:  make(map[*websocket.Conn]MessageHandler),
+		connRuleID:   make(map[*websocket.Conn]string),
+		smuxHandlers: make(map[string]SmuxStreamHandler),
+		smuxSessions: make(map[*smux.Session]string),
+		smuxConfig:   DefaultSmuxConfig(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  64 * 1024,
 			WriteBufferSize: 64 * 1024,
@@ -124,6 +139,27 @@ func (s *Server) RemoveHandler(ruleID string) {
 	s.handlerMu.Lock()
 	delete(s.handlers, ruleID)
 	s.handlerMu.Unlock()
+}
+
+// SetSmuxHandler sets the SMUX stream handler for a rule.
+func (s *Server) SetSmuxHandler(ruleID string, handler SmuxStreamHandler) {
+	s.smuxHandlerMu.Lock()
+	oldHandler := s.smuxHandlers[ruleID]
+	s.smuxHandlers[ruleID] = handler
+	s.smuxHandlerMu.Unlock()
+
+	// Notify old handler if exists
+	if oldHandler != nil {
+		oldHandler.OnSessionClose()
+		logger.Info("updated smux stream handler for rule", "rule_id", ruleID)
+	}
+}
+
+// RemoveSmuxHandler removes the SMUX stream handler for a rule.
+func (s *Server) RemoveSmuxHandler(ruleID string) {
+	s.smuxHandlerMu.Lock()
+	delete(s.smuxHandlers, ruleID)
+	s.smuxHandlerMu.Unlock()
 }
 
 // Start starts the tunnel server with TLS.
@@ -185,6 +221,7 @@ func (s *Server) Stop() error {
 		s.cancel()
 	}
 
+	// Close all message-based connections
 	s.connMu.Lock()
 	for conn, mu := range s.connLock {
 		// Hold write lock before closing to prevent concurrent write
@@ -197,6 +234,14 @@ func (s *Server) Stop() error {
 	s.connHandler = make(map[*websocket.Conn]MessageHandler)
 	s.connRuleID = make(map[*websocket.Conn]string)
 	s.connMu.Unlock()
+
+	// Close all SMUX sessions
+	s.smuxSessionMu.Lock()
+	for session := range s.smuxSessions {
+		session.Close()
+	}
+	s.smuxSessions = make(map[*smux.Session]string)
+	s.smuxSessionMu.Unlock()
 
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -220,7 +265,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	writeMu := &sync.Mutex{}
 
 	// Perform handshake
-	ruleID, isProbe, err := s.performHandshake(conn, writeMu)
+	ruleID, isProbe, enableSmux, err := s.performHandshake(conn, writeMu)
 	if err != nil {
 		logger.Error("tunnel handshake failed", "remote", r.RemoteAddr, "error", err)
 		conn.Close()
@@ -238,6 +283,12 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			logger.Info("probe connection closed", "remote", r.RemoteAddr, "rule_id", ruleID)
 		}()
 		s.probeReadLoop(conn, sender)
+		return
+	}
+
+	// Handle SMUX connections
+	if enableSmux {
+		s.handleSmuxConnection(conn, ruleID, r.RemoteAddr)
 		return
 	}
 
@@ -312,7 +363,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	s.readLoop(conn, sender)
 }
 
-func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, err error) {
+func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ruleID string, isProbe bool, enableSmux bool, err error) {
 	// Set read deadline for handshake
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -320,12 +371,12 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ru
 	// Read handshake message
 	_, data, err := conn.ReadMessage()
 	if err != nil {
-		return "", false, fmt.Errorf("read handshake: %w", err)
+		return "", false, false, fmt.Errorf("read handshake: %w", err)
 	}
 
 	var handshake forward.TunnelHandshake
 	if err := json.Unmarshal(data, &handshake); err != nil {
-		return "", false, fmt.Errorf("unmarshal handshake: %w", err)
+		return "", false, false, fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
 	// Log received token info for debugging
@@ -333,7 +384,7 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ru
 	if len(tokenDbg) > 15 {
 		tokenDbg = tokenDbg[:15] + "..."
 	}
-	logger.Debug("received tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe)
+	logger.Debug("received tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg, "is_probe", handshake.IsProbe, "enable_smux", handshake.EnableSmux)
 
 	// Verify handshake via server API with timeout
 	logger.Debug("verifying handshake via server API", "rule_id", handshake.RuleID)
@@ -351,23 +402,23 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (ru
 		writeMu.Lock()
 		conn.WriteMessage(websocket.TextMessage, resultData)
 		writeMu.Unlock()
-		return "", false, fmt.Errorf("verify handshake via server: %w", err)
+		return "", false, false, fmt.Errorf("verify handshake via server: %w", err)
 	}
 
 	// Send success result
 	resultData, err := json.Marshal(result)
 	if err != nil {
-		return "", false, fmt.Errorf("marshal result: %w", err)
+		return "", false, false, fmt.Errorf("marshal result: %w", err)
 	}
 	writeMu.Lock()
 	err = conn.WriteMessage(websocket.TextMessage, resultData)
 	writeMu.Unlock()
 	if err != nil {
-		return "", false, fmt.Errorf("send result: %w", err)
+		return "", false, false, fmt.Errorf("send result: %w", err)
 	}
 
-	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe)
-	return handshake.RuleID, handshake.IsProbe, nil
+	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID, "is_probe", handshake.IsProbe, "enable_smux", handshake.EnableSmux)
+	return handshake.RuleID, handshake.IsProbe, handshake.EnableSmux, nil
 }
 
 func (s *Server) readLoop(conn *websocket.Conn, sender *connSender) {
@@ -479,4 +530,90 @@ func (s *connSender) SendMessage(msg *Message) error {
 	}
 
 	return nil
+}
+
+// handleSmuxConnection handles a WebSocket connection with SMUX multiplexing.
+func (s *Server) handleSmuxConnection(conn *websocket.Conn, ruleID, remoteAddr string) {
+	// Wrap WebSocket as net.Conn for SMUX
+	netConn := NewWSConn(conn)
+
+	// Create SMUX session as server
+	session, err := smux.Server(netConn, s.smuxConfig.ToSmuxConfig())
+	if err != nil {
+		logger.Error("create smux session failed", "remote", remoteAddr, "error", err)
+		conn.Close()
+		return
+	}
+
+	// Register session
+	s.smuxSessionMu.Lock()
+	s.smuxSessions[session] = ruleID
+	s.smuxSessionMu.Unlock()
+
+	logger.Info("smux session established via ws", "remote", remoteAddr, "rule_id", ruleID)
+
+	defer func() {
+		// Unregister and close session
+		s.smuxSessionMu.Lock()
+		delete(s.smuxSessions, session)
+		s.smuxSessionMu.Unlock()
+
+		session.Close()
+
+		// Notify handler
+		s.smuxHandlerMu.RLock()
+		handler := s.smuxHandlers[ruleID]
+		s.smuxHandlerMu.RUnlock()
+		if handler != nil {
+			handler.OnSessionClose()
+		}
+
+		logger.Info("smux session closed via ws", "remote", remoteAddr, "rule_id", ruleID)
+	}()
+
+	s.acceptSmuxStreams(session, ruleID, remoteAddr)
+}
+
+// acceptSmuxStreams accepts and handles streams from a SMUX session.
+func (s *Server) acceptSmuxStreams(session *smux.Session, ruleID, remoteAddr string) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := session.AcceptStream()
+		if err != nil {
+			// Normal closure conditions - don't log as error
+			if s.ctx.Err() != nil || session.IsClosed() {
+				return
+			}
+			// EOF is normal when client closes the session
+			if err == io.EOF || err.Error() == "EOF" {
+				logger.Debug("smux session closed by client", "remote", remoteAddr)
+				return
+			}
+			logger.Error("smux accept stream error", "remote", remoteAddr, "error", err)
+			return
+		}
+
+		// Get handler for this rule
+		s.smuxHandlerMu.RLock()
+		handler := s.smuxHandlers[ruleID]
+		s.smuxHandlerMu.RUnlock()
+
+		if handler == nil {
+			logger.Warn("no smux handler for stream", "rule_id", ruleID)
+			stream.Close()
+			continue
+		}
+
+		// Handle stream in a goroutine
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			handler.HandleStream(stream)
+		}()
+	}
 }

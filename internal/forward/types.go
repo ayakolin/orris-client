@@ -30,16 +30,35 @@ const (
 	TunnelTypeWS TunnelType = "ws"
 	// TunnelTypeTLS represents TLS tunnel.
 	TunnelTypeTLS TunnelType = "tls"
+	// TunnelTypeWSSmux represents WebSocket tunnel with SMUX multiplexing.
+	TunnelTypeWSSmux TunnelType = "ws_smux"
+	// TunnelTypeTLSSmux represents TLS tunnel with SMUX multiplexing.
+	TunnelTypeTLSSmux TunnelType = "tls_smux"
 )
 
-// IsWS returns true if this is a WebSocket tunnel (or default).
+// IsWS returns true if this is a WebSocket tunnel (with or without SMUX).
 func (t TunnelType) IsWS() bool {
-	return t == TunnelTypeWS || t == ""
+	return t == TunnelTypeWS || t == TunnelTypeWSSmux || t == ""
 }
 
-// IsTLS returns true if this is a TLS tunnel.
+// IsTLS returns true if this is a TLS tunnel (with or without SMUX).
 func (t TunnelType) IsTLS() bool {
-	return t == TunnelTypeTLS
+	return t == TunnelTypeTLS || t == TunnelTypeTLSSmux
+}
+
+// IsWSSmux returns true if this is a WebSocket tunnel with SMUX.
+func (t TunnelType) IsWSSmux() bool {
+	return t == TunnelTypeWSSmux
+}
+
+// IsTLSSmux returns true if this is a TLS tunnel with SMUX.
+func (t TunnelType) IsTLSSmux() bool {
+	return t == TunnelTypeTLSSmux
+}
+
+// IsSmux returns true if this tunnel uses SMUX multiplexing.
+func (t TunnelType) IsSmux() bool {
+	return t == TunnelTypeWSSmux || t == TunnelTypeTLSSmux
 }
 
 // LoadBalanceStrategy represents the load balancing strategy for multi-exit rules.
@@ -392,9 +411,10 @@ const (
 // TunnelHandshake is sent by entry agent to exit agent when establishing a tunnel connection.
 // The exit agent should verify the token and check if the rule allows this connection.
 type TunnelHandshake struct {
-	AgentToken string `json:"agent_token"`          // Entry agent's HMAC-based token for verification
-	RuleID     string `json:"rule_id"`              // The rule this connection belongs to (e.g., "fr_xK9mP2vL3nQ")
-	IsProbe    bool   `json:"is_probe,omitempty"`   // True if this is a probe connection (tunnel ping)
+	AgentToken string `json:"agent_token"`           // Entry agent's HMAC-based token for verification
+	RuleID     string `json:"rule_id"`               // The rule this connection belongs to (e.g., "fr_xK9mP2vL3nQ")
+	IsProbe    bool   `json:"is_probe,omitempty"`    // True if this is a probe connection (tunnel ping)
+	EnableSmux bool   `json:"enable_smux,omitempty"` // True if SMUX multiplexing should be enabled
 }
 
 // TunnelHandshakeResult is sent by exit agent back to entry agent after verification.
