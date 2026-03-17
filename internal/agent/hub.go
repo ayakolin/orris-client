@@ -356,7 +356,8 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 		old.TunnelType != new.TunnelType ||
 		old.IsLastInChain != new.IsLastInChain ||
 		old.HopMode != new.HopMode ||
-		old.OutboundMode != new.OutboundMode {
+		old.OutboundMode != new.OutboundMode ||
+		old.AddressPreference != new.AddressPreference {
 		return true
 	}
 
@@ -468,6 +469,7 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		NextHopTlsPort:         data.NextHopTlsPort,
 		NextHopPort:            data.NextHopPort,
 		NextHopConnectionToken: data.NextHopConnectionToken,
+		AddressPreference:      data.AddressPreference,
 		TunnelHops:             data.TunnelHops,
 		HopMode:                data.HopMode,
 		InboundMode:            data.InboundMode,

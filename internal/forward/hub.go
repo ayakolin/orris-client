@@ -280,6 +280,7 @@ type RuleSyncData struct {
 	NextHopTlsPort         uint16   `json:"next_hop_tls_port,omitempty"`         // Next agent's TLS port
 	NextHopPort            uint16   `json:"next_hop_port,omitempty"`             // Next agent's listen port for direct_chain
 	NextHopConnectionToken string   `json:"next_hop_connection_token,omitempty"` // Short-term token for next hop authentication
+	AddressPreference      string   `json:"address_preference,omitempty"`        // Address preference for next hop: auto, public, tunnel
 	TunnelHops             *int     `json:"tunnel_hops,omitempty"`               // Number of hops using tunnel (nil=full tunnel)
 	HopMode                string   `json:"hop_mode,omitempty"`                  // Hop mode: "tunnel", "direct", or "boundary"
 	InboundMode            string   `json:"inbound_mode,omitempty"`              // For boundary nodes: inbound mode
