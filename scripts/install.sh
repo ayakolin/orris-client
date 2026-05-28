@@ -1,25 +1,31 @@
 #!/bin/bash
 
-# Orris Forward Agent Installer
+# Orris Forward Agent Installer (multi-instance)
 # Usage:
-#   Install:   curl -fsSL URL | sudo bash -s -- -s URL -t TOKEN
-#   Uninstall: curl -fsSL URL | sudo bash -s -- uninstall
+#   Install:           curl -fsSL URL | sudo bash -s -- -s URL -t TOKEN [-n INSTANCE]
+#   Uninstall one:     curl -fsSL URL | sudo bash -s -- uninstall [-n INSTANCE]
+#   Uninstall all:     curl -fsSL URL | sudo bash -s -- uninstall --all
+#   List instances:    curl -fsSL URL | sudo bash -s -- list
 
 set -e
 
-# Configuration
+# Static configuration
 BINARY_NAME="orris-client"
-SERVICE_NAME="orris-forward-agent"
+BASE_SERVICE_NAME="orris-forward-agent"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/orris"
-CONFIG_FILE="${CONFIG_DIR}/client.env"
-LOG_FILE="/var/log/${SERVICE_NAME}.log"
-SYSTEMD_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-OPENRC_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/orris-inc/orris-client/releases/latest/download}"
 DOWNLOAD_TIMEOUT=120
 CONNECT_TIMEOUT=10
 MAX_RETRIES=3
+
+# Instance-specific (populated by derive_paths after INSTANCE is known)
+INSTANCE=""
+SERVICE_NAME=""
+CONFIG_FILE=""
+LOG_FILE=""
+SYSTEMD_SERVICE_FILE=""
+OPENRC_SERVICE_FILE=""
 INIT_SYSTEM=""
 
 # Colors for output
@@ -51,27 +57,68 @@ check_root() {
 
 # Usage help
 usage() {
-    echo "Orris Forward Agent Installer"
+    echo "Orris Forward Agent Installer (multi-instance)"
     echo ""
     echo "Usage:"
     echo "  Install:"
-    echo "    sudo bash $0 -s <url> -t <token> [-W <port>] [-T <port>] [-l <level>] [--version <ver>]"
+    echo "    sudo bash $0 -s <url> -t <token> [-n <instance>] [-W <port>] [-T <port>] [-l <level>] [--version <ver>]"
     echo ""
-    echo "  Uninstall:"
-    echo "    sudo bash $0 uninstall"
+    echo "  Uninstall a single instance:"
+    echo "    sudo bash $0 uninstall [-n <instance>]"
+    echo ""
+    echo "  Uninstall every instance and remove the binary:"
+    echo "    sudo bash $0 uninstall --all"
+    echo ""
+    echo "  List installed instances:"
+    echo "    sudo bash $0 list"
     echo ""
     echo "Options:"
-    echo "  -s, --server URL      Server URL (required)"
-    echo "  -t, --token TOKEN     Agent token (required)"
-    echo "  -W, --ws-port PORT    WebSocket listen port (0 = random)"
-    echo "  -T, --tls-port PORT   TLS listen port (0 = random)"
+    echo "  -s, --server URL      Server URL (required for install)"
+    echo "  -t, --token TOKEN     Agent token (required for install)"
+    echo "  -n, --name NAME       Instance name (default: 'default'; allowed: [a-zA-Z0-9_-], max 32 chars)"
+    echo "  -W, --ws-port PORT    WebSocket listen port (0 = random; required to differ per instance if not 0)"
+    echo "  -T, --tls-port PORT   TLS listen port (0 = random; required to differ per instance if not 0)"
     echo "  -l, --loglevel LEVEL  Log level (debug, info, warn, error)"
-    echo "      --version VER     Specific version (default: latest)"
+    echo "      --version VER     Specific binary version (default: latest)"
+    echo "      --all             (uninstall only) remove every instance and the shared binary"
     echo "  -h, --help            Show this help"
+    echo ""
+    echo "Notes:"
+    echo "  - All instances share the binary at ${INSTALL_DIR}/${BINARY_NAME}."
+    echo "  - The 'default' instance keeps the legacy paths (${BASE_SERVICE_NAME}.service,"
+    echo "    ${CONFIG_DIR}/client.env) for backward compatibility."
+    echo "  - Other instances use suffixed names: ${BASE_SERVICE_NAME}-<NAME>.service, ${CONFIG_DIR}/client-<NAME>.env."
+    echo "  - When running multiple instances on one host, set distinct -W/-T ports (or 0 for random) to avoid conflicts."
     echo ""
     echo "Examples:"
     echo "  sudo bash $0 -s https://api.example.com -t fwd_xxx"
-    echo "  sudo bash $0 --server https://api.example.com --token fwd_xxx -W 8080"
+    echo "  sudo bash $0 -s https://api.example.com -t fwd_yyy -n agent-b -W 0 -T 0"
+}
+
+# Validate instance name (whitelisted characters, prevents path injection)
+validate_instance_name() {
+    local name="$1"
+    if ! echo "$name" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$'; then
+        print_error "Invalid instance name: '$name'"
+        print_error "Must start with alphanumeric, contain only [a-zA-Z0-9_-], and be at most 32 chars"
+        exit 1
+    fi
+}
+
+# Derive all instance-specific paths from INSTANCE.
+# The 'default' instance keeps legacy filenames to preserve backward compatibility
+# with hosts already running the single-instance installer.
+derive_paths() {
+    if [ -z "$INSTANCE" ] || [ "$INSTANCE" = "default" ]; then
+        SERVICE_NAME="${BASE_SERVICE_NAME}"
+        CONFIG_FILE="${CONFIG_DIR}/client.env"
+    else
+        SERVICE_NAME="${BASE_SERVICE_NAME}-${INSTANCE}"
+        CONFIG_FILE="${CONFIG_DIR}/client-${INSTANCE}.env"
+    fi
+    LOG_FILE="/var/log/${SERVICE_NAME}.log"
+    SYSTEMD_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    OPENRC_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 }
 
 # Detect platform
@@ -140,12 +187,11 @@ download_binary() {
     local version="$1"
     local binary_filename="${BINARY_NAME}-${OS}-${ARCH}"
     local download_url
-    local temp_file="/tmp/${binary_filename}"
+    local temp_file="/tmp/${binary_filename}.$$"
 
     if [ "$version" = "latest" ]; then
         download_url="${DOWNLOAD_URL}/${binary_filename}"
     else
-        # Replace "latest/download" with "download/<version>" without bash-specific substitution
         local base_url
         base_url=$(echo "$DOWNLOAD_URL" | sed "s|latest/download|download/${version}|")
         download_url="${base_url}/${binary_filename}"
@@ -186,9 +232,9 @@ create_config() {
     print_info "Creating configuration directory..."
     mkdir -p "$CONFIG_DIR"
 
-    print_info "Creating configuration file..."
+    print_info "Creating configuration file at $CONFIG_FILE ..."
     cat > "$CONFIG_FILE" <<EOF
-# Orris Client Configuration
+# Orris Client Configuration (instance: ${INSTANCE:-default})
 ORRIS_SERVER_URL=${server}
 ORRIS_TOKEN=${token}
 EOF
@@ -198,12 +244,11 @@ EOF
     [ -n "$loglevel" ] && echo "ORRIS_LOG_LEVEL=${loglevel}"       >> "$CONFIG_FILE"
 
     chmod 600 "$CONFIG_FILE"
-    print_info "Configuration file created at $CONFIG_FILE"
 }
 
 # Create systemd service file
 create_systemd_service() {
-    print_info "Creating systemd service..."
+    print_info "Creating systemd service ${SERVICE_NAME}..."
 
     local security_opts=""
     if check_namespace_support; then
@@ -222,7 +267,7 @@ NoNewPrivileges=true"
 
     cat > "$SYSTEMD_SERVICE_FILE" <<EOF
 [Unit]
-Description=Orris Forward Agent
+Description=Orris Forward Agent (${INSTANCE:-default})
 Documentation=https://github.com/orris-inc/orris-client
 After=network-online.target
 Wants=network-online.target
@@ -246,18 +291,17 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    print_info "Systemd service created"
 }
 
 # Create OpenRC service file
 create_openrc_service() {
-    print_info "Creating OpenRC service..."
+    print_info "Creating OpenRC service ${SERVICE_NAME}..."
 
     cat > "$OPENRC_SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
-# Orris Forward Agent OpenRC init script
+# Orris Forward Agent OpenRC init script (instance: ${INSTANCE:-default})
 
-name="Orris Forward Agent"
+name="Orris Forward Agent (${INSTANCE:-default})"
 description="Orris Forward Agent"
 
 command="${INSTALL_DIR}/${BINARY_NAME}"
@@ -290,7 +334,6 @@ start_pre() {
 EOF
 
     chmod +x "$OPENRC_SERVICE_FILE"
-    print_info "OpenRC service created"
 }
 
 # Create service (dispatcher)
@@ -303,7 +346,7 @@ create_service() {
 
 # Start service
 start_service() {
-    print_info "Enabling and starting service..."
+    print_info "Enabling and starting ${SERVICE_NAME}..."
     case "$INIT_SYSTEM" in
         systemd)
             systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
@@ -316,18 +359,18 @@ start_service() {
     esac
 }
 
-# Stop service if running
+# Stop service if running (scoped to current SERVICE_NAME, never touches siblings)
 stop_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-                print_info "Stopping service..."
+                print_info "Stopping ${SERVICE_NAME}..."
                 systemctl stop "${SERVICE_NAME}" || true
             fi
             ;;
         openrc)
             if rc-service "${SERVICE_NAME}" status >/dev/null 2>&1; then
-                print_info "Stopping service..."
+                print_info "Stopping ${SERVICE_NAME}..."
                 rc-service "${SERVICE_NAME}" stop || true
             fi
             ;;
@@ -342,37 +385,40 @@ is_service_active() {
     esac
 }
 
-# Kill leftover process by name with timeout (defensive cleanup)
-kill_process() {
-    if ! command -v pgrep >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if ! pgrep -x "${BINARY_NAME}" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    print_info "Sending SIGTERM to leftover ${BINARY_NAME} processes..."
-    pkill -x "${BINARY_NAME}" 2>/dev/null || true
-
-    local count=0
-    while [ $count -lt 10 ]; do
-        if ! pgrep -x "${BINARY_NAME}" >/dev/null 2>&1; then
-            print_info "Process terminated gracefully"
-            return 0
-        fi
-        sleep 1
-        count=$((count + 1))
-    done
-
-    if pgrep -x "${BINARY_NAME}" >/dev/null 2>&1; then
-        print_warn "Process did not terminate gracefully, sending SIGKILL..."
-        pkill -9 -x "${BINARY_NAME}" 2>/dev/null || true
-        sleep 1
-    fi
+# Enumerate installed instances by scanning service files.
+# Prints one instance name per line.
+list_installed_instances() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            for f in "/etc/systemd/system/${BASE_SERVICE_NAME}.service" \
+                     "/etc/systemd/system/${BASE_SERVICE_NAME}-"*.service; do
+                [ -f "$f" ] || continue
+                local base
+                base=$(basename "$f" .service)
+                if [ "$base" = "$BASE_SERVICE_NAME" ]; then
+                    echo "default"
+                else
+                    echo "${base#${BASE_SERVICE_NAME}-}"
+                fi
+            done
+            ;;
+        openrc)
+            for f in "/etc/init.d/${BASE_SERVICE_NAME}" \
+                     "/etc/init.d/${BASE_SERVICE_NAME}-"*; do
+                [ -f "$f" ] || continue
+                local base
+                base=$(basename "$f")
+                if [ "$base" = "$BASE_SERVICE_NAME" ]; then
+                    echo "default"
+                else
+                    echo "${base#${BASE_SERVICE_NAME}-}"
+                fi
+            done
+            ;;
+    esac
 }
 
-# Install function
+# Install function (single instance)
 install() {
     local server="$1"
     local token="$2"
@@ -381,17 +427,40 @@ install() {
     local tls_port="$5"
     local loglevel="$6"
 
-    print_info "Starting Orris Forward Agent installation..."
+    print_info "Installing Orris Forward Agent (instance: ${INSTANCE:-default})..."
 
     detect_platform
     detect_init_system
+    derive_paths
 
+    # Warn if other instances exist and the user did not pick distinct ports
+    local other_count=0
+    while IFS= read -r existing; do
+        [ -z "$existing" ] && continue
+        if [ "$existing" != "${INSTANCE:-default}" ]; then
+            other_count=$((other_count + 1))
+        fi
+    done <<< "$(list_installed_instances)"
+
+    if [ "$other_count" -gt 0 ]; then
+        if [ -n "$ws_port" ] && [ "$ws_port" != "0" ]; then
+            print_warn "Other instances are present. Ensure WS port $ws_port does not collide with them."
+        fi
+        if [ -n "$tls_port" ] && [ "$tls_port" != "0" ]; then
+            print_warn "Other instances are present. Ensure TLS port $tls_port does not collide with them."
+        fi
+        if [ -z "$ws_port" ] && [ -z "$tls_port" ]; then
+            print_warn "Other instances are present and no -W/-T given. Consider -W 0 -T 0 to avoid port conflicts."
+        fi
+    fi
+
+    # Stop only the current instance's service, so siblings keep running
     stop_service
 
-    # Backup existing binary if present
+    # Backup existing binary if present (binary is shared across all instances)
     if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
         print_info "Backing up existing binary..."
-        mv "${INSTALL_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}.bak"
+        cp "${INSTALL_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}.bak"
     fi
 
     if ! download_binary "$version"; then
@@ -410,15 +479,21 @@ install() {
 
     sleep 2
     if is_service_active; then
-        print_info "Installation completed successfully!"
+        print_info "Instance '${INSTANCE:-default}' installed and running."
     else
         print_warn "Service may not be running properly. Check logs."
     fi
 
-    # Show installed version
+    # Show installed binary version
     local installed_version
     if installed_version=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null); then
         print_info "Version: $installed_version"
+    fi
+
+    # If other instances exist and the binary was just upgraded, they will pick up
+    # the new binary on their next restart. Surface this so the user is not surprised.
+    if [ "$other_count" -gt 0 ]; then
+        print_warn "Binary at ${INSTALL_DIR}/${BINARY_NAME} is shared. Other instances will use the new binary after they restart."
     fi
 
     echo ""
@@ -441,75 +516,150 @@ install() {
     echo ""
 }
 
-# Uninstall function
-uninstall() {
-    print_info "Starting Orris Forward Agent uninstallation..."
-
-    detect_init_system
-
-    # Stop and disable service based on init system
+# Remove a single instance's service unit, config, and log (does NOT touch the shared binary)
+uninstall_one_resources() {
     case "$INIT_SYSTEM" in
         systemd)
             if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
-                print_info "Stopping service..."
+                print_info "Stopping ${SERVICE_NAME}..."
                 systemctl stop "${SERVICE_NAME}" || true
                 sleep 2
             fi
             if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
-                print_info "Disabling service..."
+                print_info "Disabling ${SERVICE_NAME}..."
                 systemctl disable "${SERVICE_NAME}" || true
+            fi
+            if [ -f "$SYSTEMD_SERVICE_FILE" ]; then
+                print_info "Removing service file ${SYSTEMD_SERVICE_FILE}..."
+                rm -f "$SYSTEMD_SERVICE_FILE"
+                systemctl daemon-reload || true
             fi
             ;;
         openrc)
             if rc-service "${SERVICE_NAME}" status >/dev/null 2>&1; then
-                print_info "Stopping service..."
+                print_info "Stopping ${SERVICE_NAME}..."
                 rc-service "${SERVICE_NAME}" stop || true
                 sleep 2
             fi
             if rc-update show default 2>/dev/null | grep -q "${SERVICE_NAME}"; then
-                print_info "Disabling service..."
+                print_info "Disabling ${SERVICE_NAME}..."
                 rc-update del "${SERVICE_NAME}" default || true
             fi
-            ;;
-    esac
-
-    # Defensive cleanup for non-service starts
-    kill_process
-
-    # Remove service file
-    case "$INIT_SYSTEM" in
-        systemd)
-            if [ -f "$SYSTEMD_SERVICE_FILE" ]; then
-                print_info "Removing service file..."
-                rm -f "$SYSTEMD_SERVICE_FILE"
-                systemctl daemon-reload
-            fi
-            ;;
-        openrc)
             if [ -f "$OPENRC_SERVICE_FILE" ]; then
-                print_info "Removing service file..."
+                print_info "Removing service file ${OPENRC_SERVICE_FILE}..."
                 rm -f "$OPENRC_SERVICE_FILE"
             fi
             ;;
     esac
 
+    if [ -f "$CONFIG_FILE" ]; then
+        print_info "Removing config ${CONFIG_FILE}..."
+        rm -f "$CONFIG_FILE"
+    fi
+    if [ -f "$LOG_FILE" ]; then
+        print_info "Removing log ${LOG_FILE}..."
+        rm -f "$LOG_FILE"
+    fi
+}
+
+# Uninstall a single instance (binary is preserved because other instances may use it)
+uninstall_one() {
+    detect_init_system
+    derive_paths
+
+    local exists=0
+    [ -f "$SYSTEMD_SERVICE_FILE" ] && exists=1
+    [ -f "$OPENRC_SERVICE_FILE" ] && exists=1
+    [ -f "$CONFIG_FILE" ] && exists=1
+
+    if [ $exists -eq 0 ]; then
+        print_warn "Instance '${INSTANCE:-default}' not found (no service or config file). Nothing to do."
+        exit 0
+    fi
+
+    print_info "Uninstalling instance: ${INSTANCE:-default}"
+    uninstall_one_resources
+
+    # Report remaining instances so the operator knows the binary is intentionally kept
+    local remaining=0
+    while IFS= read -r inst; do
+        [ -z "$inst" ] && continue
+        remaining=$((remaining + 1))
+    done <<< "$(list_installed_instances)"
+
+    if [ "$remaining" -gt 0 ]; then
+        print_info "Instance removed. $remaining other instance(s) still present; binary at ${INSTALL_DIR}/${BINARY_NAME} is preserved."
+    else
+        print_info "Instance removed. No other instances present; use 'uninstall --all' to also remove the binary."
+    fi
+}
+
+# Uninstall every instance and remove the shared binary
+uninstall_all() {
+    detect_init_system
+
+    local instances=()
+    while IFS= read -r inst; do
+        [ -z "$inst" ] && continue
+        instances+=("$inst")
+    done <<< "$(list_installed_instances)"
+
+    if [ ${#instances[@]} -eq 0 ]; then
+        print_info "No instances installed."
+    else
+        print_info "Removing ${#instances[@]} instance(s): ${instances[*]}"
+        for inst in "${instances[@]}"; do
+            INSTANCE="$inst"
+            derive_paths
+            print_info "--- Removing instance: $inst ---"
+            uninstall_one_resources
+        done
+    fi
+
     if [ -f "${INSTALL_DIR}/${BINARY_NAME}" ]; then
-        print_info "Removing binary..."
+        print_info "Removing binary ${INSTALL_DIR}/${BINARY_NAME}..."
         rm -f "${INSTALL_DIR}/${BINARY_NAME}"
     fi
     rm -f "${INSTALL_DIR}/${BINARY_NAME}.bak"
 
     if [ -d "$CONFIG_DIR" ]; then
-        print_info "Removing configuration directory..."
-        rm -rf "$CONFIG_DIR"
-    fi
-
-    if [ -f "$LOG_FILE" ]; then
-        print_info "Removing log file..."
-        rm -f "$LOG_FILE"
+        if [ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
+            rmdir "$CONFIG_DIR"
+            print_info "Removed empty config directory $CONFIG_DIR"
+        else
+            print_warn "Config directory $CONFIG_DIR is not empty, leaving it in place"
+        fi
     fi
 
     print_info "Uninstallation completed successfully!"
+}
+
+# List installed instances with their status
+list_instances() {
+    detect_init_system
+
+    local instances=()
+    while IFS= read -r inst; do
+        [ -z "$inst" ] && continue
+        instances+=("$inst")
+    done <<< "$(list_installed_instances)"
+
+    if [ ${#instances[@]} -eq 0 ]; then
+        echo "No Orris Forward Agent instances installed."
+        return 0
+    fi
+
+    printf "%-20s %-10s %s\n" "INSTANCE" "STATUS" "CONFIG"
+    printf "%-20s %-10s %s\n" "--------" "------" "------"
+    for inst in "${instances[@]}"; do
+        INSTANCE="$inst"
+        derive_paths
+        local status="inactive"
+        if is_service_active; then
+            status="active"
+        fi
+        printf "%-20s %-10s %s\n" "$inst" "$status" "$CONFIG_FILE"
+    done
 }
 
 # Main
@@ -519,11 +669,46 @@ main() {
         exit 1
     fi
 
-    # Handle subcommands and help first (uninstall does not require args)
+    # Handle subcommands and help first
     case "$1" in
         uninstall)
+            shift
             check_root
-            uninstall
+
+            local uninstall_all_flag=0
+            local instance_arg=""
+
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --all)         uninstall_all_flag=1; shift ;;
+                    -n|--name)     instance_arg="$2";    shift 2 ;;
+                    -h|--help)     usage; exit 0 ;;
+                    *)
+                        print_error "Unknown option for uninstall: $1"
+                        usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            if [ $uninstall_all_flag -eq 1 ]; then
+                if [ -n "$instance_arg" ]; then
+                    print_error "--all and -n/--name are mutually exclusive"
+                    exit 1
+                fi
+                uninstall_all
+            else
+                if [ -n "$instance_arg" ]; then
+                    validate_instance_name "$instance_arg"
+                    INSTANCE="$instance_arg"
+                fi
+                uninstall_one
+            fi
+            exit 0
+            ;;
+        list)
+            check_root
+            list_instances
             exit 0
             ;;
         -h|--help)
@@ -536,15 +721,17 @@ main() {
 
     local server="" token="" version="latest"
     local ws_port="" tls_port="" loglevel=""
+    local instance_arg=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            -s|--server)   server="$2";   shift 2 ;;
-            -t|--token)    token="$2";    shift 2 ;;
-            -W|--ws-port)  ws_port="$2";  shift 2 ;;
-            -T|--tls-port) tls_port="$2"; shift 2 ;;
-            -l|--loglevel) loglevel="$2"; shift 2 ;;
-            --version)     version="$2";  shift 2 ;;
+            -s|--server)   server="$2";       shift 2 ;;
+            -t|--token)    token="$2";        shift 2 ;;
+            -n|--name)     instance_arg="$2"; shift 2 ;;
+            -W|--ws-port)  ws_port="$2";      shift 2 ;;
+            -T|--tls-port) tls_port="$2";     shift 2 ;;
+            -l|--loglevel) loglevel="$2";     shift 2 ;;
+            --version)     version="$2";      shift 2 ;;
             -h|--help)     usage; exit 0 ;;
             *)
                 print_error "Unknown option: $1"
@@ -564,6 +751,11 @@ main() {
         print_error "Missing required parameter: -t/--token"
         usage
         exit 1
+    fi
+
+    if [ -n "$instance_arg" ]; then
+        validate_instance_name "$instance_arg"
+        INSTANCE="$instance_arg"
     fi
 
     install "$server" "$token" "$version" "$ws_port" "$tls_port" "$loglevel"
