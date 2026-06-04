@@ -19,8 +19,8 @@ import (
 // udpClientEntry tracks UDP client state for cleanup.
 type udpClientEntry struct {
 	connID         uint64
-	tunnelIdx      int           // index of tunnel used by this UDP client
-	lastActiveNano atomic.Int64  // Unix nanoseconds, safe for concurrent access
+	tunnelIdx      int          // index of tunnel used by this UDP client
+	lastActiveNano atomic.Int64 // Unix nanoseconds, safe for concurrent access
 }
 
 // tunnelEntry represents a tunnel with its weight for load balancing.
@@ -40,8 +40,8 @@ type EntryForwarder struct {
 	tunnel tunnel.Sender
 
 	// Multi-tunnel mode for load balancing
-	tunnels             []tunnelEntry           // multiple tunnels with weights
-	totalWeight         uint32                  // sum of all weights for random selection
+	tunnels             []tunnelEntry               // multiple tunnels with weights
+	totalWeight         uint32                      // sum of all weights for random selection
 	loadBalanceStrategy forward.LoadBalanceStrategy // load balance strategy: failover (default), weighted
 
 	// Health checker for multi-tunnel mode (nil if health check disabled)
@@ -371,6 +371,7 @@ func (f *EntryForwarder) Start(ctx context.Context) error {
 
 	logger.Info("entry forwarder started",
 		"rule_id", f.rule.ID,
+		"listen_ip", f.rule.ListenIP,
 		"listen_port", f.rule.ListenPort,
 		"exit_agents", exitAgentInfo,
 		"protocol", protocol)
@@ -380,7 +381,7 @@ func (f *EntryForwarder) Start(ctx context.Context) error {
 
 // startTCP starts the TCP listener.
 func (f *EntryForwarder) startTCP() error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tcp listen on %s: %w", addr, err)
@@ -395,7 +396,7 @@ func (f *EntryForwarder) startTCP() error {
 
 // startUDP starts the UDP listener.
 func (f *EntryForwarder) startUDP() error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return fmt.Errorf("resolve udp addr %s: %w", addr, err)
@@ -453,6 +454,14 @@ func (f *EntryForwarder) Traffic() *TrafficCounter {
 // RuleID returns the rule ID.
 func (f *EntryForwarder) RuleID() string {
 	return f.rule.ID
+}
+
+// ListenIP returns the actual listening IP, or empty for wildcard listeners.
+func (f *EntryForwarder) ListenIP() string {
+	if ip := tcpListenIP(f.tcpListener, f.rule.ListenIP); ip != "" {
+		return ip
+	}
+	return udpListenIP(f.udpConn, f.rule.ListenIP)
 }
 
 // IsTunnelConnected returns true if at least one tunnel is connected.

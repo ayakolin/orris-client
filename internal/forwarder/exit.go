@@ -469,6 +469,11 @@ func (f *ExitForwarder) cleanupIdleUDPClients() {
 	}
 }
 
+// ListenIP returns empty because ExitForwarder does not listen locally.
+func (f *ExitForwarder) ListenIP() string {
+	return ""
+}
+
 // ListenPort returns 0 as ExitForwarder does not have a listening port.
 func (f *ExitForwarder) ListenPort() uint16 {
 	return 0

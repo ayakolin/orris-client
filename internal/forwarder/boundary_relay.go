@@ -476,6 +476,11 @@ func (f *BoundaryRelayForwarder) cleanupIdleUDPClients() {
 	}
 }
 
+// ListenIP returns empty because BoundaryRelayForwarder does not listen locally.
+func (f *BoundaryRelayForwarder) ListenIP() string {
+	return ""
+}
+
 // ListenPort returns 0 as BoundaryRelayForwarder does not have a listening port.
 func (f *BoundaryRelayForwarder) ListenPort() uint16 {
 	return 0

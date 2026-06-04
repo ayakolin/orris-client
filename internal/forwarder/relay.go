@@ -285,6 +285,11 @@ func (h *relayOutboundHandler) HandleClose(connID uint64) {
 	h.relay.handleOutboundClose(connID)
 }
 
+// ListenIP returns empty because RelayForwarder does not listen locally.
+func (f *RelayForwarder) ListenIP() string {
+	return ""
+}
+
 // ListenPort returns 0 as RelayForwarder does not have a listening port.
 func (f *RelayForwarder) ListenPort() uint16 {
 	return 0

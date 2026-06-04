@@ -352,6 +352,7 @@ func ruleConfigChanged(old, new *forward.Rule) bool {
 		old.TargetPort != new.TargetPort ||
 		old.BindIP != new.BindIP ||
 		old.ListenPort != new.ListenPort ||
+		old.ListenIP != new.ListenIP ||
 		old.Protocol != new.Protocol ||
 		old.TunnelType != new.TunnelType ||
 		old.IsLastInChain != new.IsLastInChain ||
@@ -457,6 +458,7 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		AgentID:                data.AgentID,
 		RuleType:               forward.RuleType(data.RuleType),
 		ListenPort:             data.ListenPort,
+		ListenIP:               data.ListenIP,
 		TargetAddress:          data.TargetAddress,
 		TargetPort:             data.TargetPort,
 		BindIP:                 data.BindIP,

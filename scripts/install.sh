@@ -14,7 +14,7 @@ BINARY_NAME="orris-client"
 BASE_SERVICE_NAME="orris-forward-agent"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/orris"
-DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/orris-inc/orris-client/releases/latest/download}"
+DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/ayakolin/orris-client/releases/latest/download}"
 DOWNLOAD_TIMEOUT=120
 CONNECT_TIMEOUT=10
 MAX_RETRIES=3
@@ -268,7 +268,7 @@ NoNewPrivileges=true"
     cat > "$SYSTEMD_SERVICE_FILE" <<EOF
 [Unit]
 Description=Orris Forward Agent (${INSTANCE:-default})
-Documentation=https://github.com/orris-inc/orris-client
+Documentation=https://github.com/ayakolin/orris-client
 After=network-online.target
 Wants=network-online.target
 

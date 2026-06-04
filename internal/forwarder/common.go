@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,8 +132,35 @@ type Forwarder interface {
 	Stop() error
 	Traffic() *TrafficCounter
 	RuleID() string
+	ListenIP() string   // Returns the actual listening IP, empty if wildcard or not applicable
 	ListenPort() uint16 // Returns the actual listening port, 0 if not applicable
 	Connections() int   // Returns the current number of active connections
+}
+
+func listenAddr(listenIP string, port uint16) string {
+	return net.JoinHostPort(listenIP, strconv.Itoa(int(port)))
+}
+
+func tcpListenIP(listener net.Listener, configured string) string {
+	if configured == "" || listener == nil {
+		return ""
+	}
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || addr.IP == nil || addr.IP.IsUnspecified() {
+		return ""
+	}
+	return addr.IP.String()
+}
+
+func udpListenIP(conn *net.UDPConn, configured string) string {
+	if configured == "" || conn == nil {
+		return ""
+	}
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil || addr.IP.IsUnspecified() {
+		return ""
+	}
+	return addr.IP.String()
 }
 
 // writeQueueSize is the buffer size for async write queue.

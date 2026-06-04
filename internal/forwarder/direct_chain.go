@@ -117,6 +117,7 @@ func (f *DirectChainForwarder) Start(ctx context.Context) error {
 
 	logger.Info("direct chain forwarder started",
 		"rule_id", f.rule.ID,
+		"listen_ip", f.rule.ListenIP,
 		"listen_port", f.rule.ListenPort,
 		"next_hop", nextHop,
 		"protocol", protocol,
@@ -127,7 +128,7 @@ func (f *DirectChainForwarder) Start(ctx context.Context) error {
 
 // startTCP starts the TCP listener and accept loop.
 func (f *DirectChainForwarder) startTCP(nextHop string) error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tcp listen on %s: %w", addr, err)
@@ -142,7 +143,7 @@ func (f *DirectChainForwarder) startTCP(nextHop string) error {
 
 // startUDP starts the UDP listener.
 func (f *DirectChainForwarder) startUDP(nextHop string) error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return fmt.Errorf("resolve udp addr %s: %w", addr, err)
@@ -206,6 +207,14 @@ func (f *DirectChainForwarder) Traffic() *TrafficCounter {
 // RuleID returns the rule ID.
 func (f *DirectChainForwarder) RuleID() string {
 	return f.rule.ID
+}
+
+// ListenIP returns the actual listening IP, or empty for wildcard listeners.
+func (f *DirectChainForwarder) ListenIP() string {
+	if ip := tcpListenIP(f.tcpListener, f.rule.ListenIP); ip != "" {
+		return ip
+	}
+	return udpListenIP(f.udpConn, f.rule.ListenIP)
 }
 
 // tcpAcceptLoop accepts TCP connections and handles them.

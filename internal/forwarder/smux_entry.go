@@ -73,6 +73,7 @@ func (f *SmuxEntryForwarder) Start(ctx context.Context) error {
 
 	logger.Info("smux entry forwarder started",
 		"rule_id", f.rule.ID,
+		"listen_ip", f.rule.ListenIP,
 		"listen_port", f.rule.ListenPort,
 		"exit_agents", exitAgentInfo,
 		"protocol", protocol)
@@ -82,7 +83,7 @@ func (f *SmuxEntryForwarder) Start(ctx context.Context) error {
 
 // startTCP starts the TCP listener.
 func (f *SmuxEntryForwarder) startTCP() error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tcp listen on %s: %w", addr, err)
@@ -135,6 +136,11 @@ func (f *SmuxEntryForwarder) Traffic() *TrafficCounter {
 // RuleID returns the rule ID.
 func (f *SmuxEntryForwarder) RuleID() string {
 	return f.rule.ID
+}
+
+// ListenIP returns the actual listening IP, or empty for wildcard listeners.
+func (f *SmuxEntryForwarder) ListenIP() string {
+	return tcpListenIP(f.tcpListener, f.rule.ListenIP)
 }
 
 // ListenPort returns the actual listening port.

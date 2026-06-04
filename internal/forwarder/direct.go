@@ -28,9 +28,9 @@ type DirectForwarder struct {
 	udpClients   map[string]*udpClient // client addr -> upstream conn
 
 	// Active TCP connections tracking
-	activeConns   atomic.Int32
-	tcpConnsMu    sync.Mutex
-	tcpConns      map[net.Conn]struct{} // active TCP connections for graceful shutdown
+	activeConns atomic.Int32
+	tcpConnsMu  sync.Mutex
+	tcpConns    map[net.Conn]struct{} // active TCP connections for graceful shutdown
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -91,6 +91,7 @@ func (f *DirectForwarder) Start(ctx context.Context) error {
 
 	logger.Info("direct forwarder started",
 		"rule_id", f.rule.ID,
+		"listen_ip", f.rule.ListenIP,
 		"listen_port", f.rule.ListenPort,
 		"target", fmt.Sprintf("%s:%d", f.rule.TargetAddress, f.rule.TargetPort),
 		"protocol", protocol)
@@ -100,7 +101,7 @@ func (f *DirectForwarder) Start(ctx context.Context) error {
 
 // startTCP starts the TCP listener.
 func (f *DirectForwarder) startTCP() error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tcp listen on %s: %w", addr, err)
@@ -115,7 +116,7 @@ func (f *DirectForwarder) startTCP() error {
 
 // startUDP starts the UDP listener.
 func (f *DirectForwarder) startUDP() error {
-	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
+	addr := listenAddr(f.rule.ListenIP, f.rule.ListenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return fmt.Errorf("resolve udp addr %s: %w", addr, err)
@@ -177,6 +178,14 @@ func (f *DirectForwarder) Traffic() *TrafficCounter {
 // RuleID returns the rule ID.
 func (f *DirectForwarder) RuleID() string {
 	return f.rule.ID
+}
+
+// ListenIP returns the actual listening IP, or empty for wildcard listeners.
+func (f *DirectForwarder) ListenIP() string {
+	if ip := tcpListenIP(f.tcpListener, f.rule.ListenIP); ip != "" {
+		return ip
+	}
+	return udpListenIP(f.udpConn, f.rule.ListenIP)
 }
 
 func (f *DirectForwarder) tcpAcceptLoop() {

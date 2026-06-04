@@ -92,25 +92,26 @@ type ExitAgent struct {
 // Rule represents a forward rule returned by the API.
 // Note: ws_listen_port field has been removed (exit type deprecated).
 type Rule struct {
-	ID                  string              `json:"id"`                                // Stripe-style prefixed ID (e.g., "fr_xK9mP2vL3nQ")
-	AgentID             string              `json:"agent_id"`                          // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
+	ID                  string              `json:"id"`       // Stripe-style prefixed ID (e.g., "fr_xK9mP2vL3nQ")
+	AgentID             string              `json:"agent_id"` // Stripe-style prefixed ID (e.g., "fa_xK9mP2vL3nQ")
 	RuleType            RuleType            `json:"rule_type"`
-	ExitAgentID         string              `json:"exit_agent_id,omitempty"`           // Stripe-style prefixed ID (mutually exclusive with ExitAgents)
-	ExitAgents          []ExitAgent         `json:"exit_agents,omitempty"`             // For entry type with load balancing (mutually exclusive with ExitAgentID)
-	LoadBalanceStrategy LoadBalanceStrategy `json:"load_balance_strategy,omitempty"`   // Load balance strategy: failover (default), weighted
+	ExitAgentID         string              `json:"exit_agent_id,omitempty"`         // Stripe-style prefixed ID (mutually exclusive with ExitAgents)
+	ExitAgents          []ExitAgent         `json:"exit_agents,omitempty"`           // For entry type with load balancing (mutually exclusive with ExitAgentID)
+	LoadBalanceStrategy LoadBalanceStrategy `json:"load_balance_strategy,omitempty"` // Load balance strategy: failover (default), weighted
 	Name                string              `json:"name"`
-	ListenPort    uint16   `json:"listen_port"`
-	TargetAddress string   `json:"target_address,omitempty"`
-	TargetPort    uint16   `json:"target_port,omitempty"`
-	BindIP        string   `json:"bind_ip,omitempty"` // Bind IP address for outbound connections
-	Protocol      string   `json:"protocol"`
-	Status        string   `json:"status"`
-	Remark        string   `json:"remark,omitempty"`
-	UploadBytes   int64    `json:"upload_bytes"`
-	DownloadBytes int64    `json:"download_bytes"`
-	TotalBytes    int64    `json:"total_bytes"`
-	CreatedAt     string   `json:"created_at"`
-	UpdatedAt     string   `json:"updated_at"`
+	ListenPort          uint16              `json:"listen_port"`
+	ListenIP            string              `json:"listen_ip,omitempty"` // Local listen IP; empty means all addresses.
+	TargetAddress       string              `json:"target_address,omitempty"`
+	TargetPort          uint16              `json:"target_port,omitempty"`
+	BindIP              string              `json:"bind_ip,omitempty"` // Bind IP address for outbound connections
+	Protocol            string              `json:"protocol"`
+	Status              string              `json:"status"`
+	Remark              string              `json:"remark,omitempty"`
+	UploadBytes         int64               `json:"upload_bytes"`
+	DownloadBytes       int64               `json:"download_bytes"`
+	TotalBytes          int64               `json:"total_bytes"`
+	CreatedAt           string              `json:"created_at"`
+	UpdatedAt           string              `json:"updated_at"`
 
 	// Role indicates the requesting agent's role in this rule
 	// Values: "entry" (needs to establish tunnel), "exit" (accepts tunnel connections), "relay" (chain middle node)
@@ -427,13 +428,14 @@ type TunnelHandshakeResult struct {
 
 // RuleSyncStatusItem represents the sync and runtime status of a single forward rule.
 type RuleSyncStatusItem struct {
-	RuleID       string `json:"rule_id"`       // Stripe-style rule ID (e.g., "fr_xK9mP2vL3nQ")
-	SyncStatus   string `json:"sync_status"`   // Sync status: synced, pending, failed
-	RunStatus    string `json:"run_status"`    // Runtime status: running, stopped, error, starting
-	ListenPort   uint16 `json:"listen_port"`   // Actual listening port
-	Connections  int    `json:"connections"`   // Current number of connections
-	ErrorMessage string `json:"error_message"` // Error message if any
-	SyncedAt     int64  `json:"synced_at"`     // Last sync timestamp (Unix seconds)
+	RuleID       string `json:"rule_id"`             // Stripe-style rule ID (e.g., "fr_xK9mP2vL3nQ")
+	SyncStatus   string `json:"sync_status"`         // Sync status: synced, pending, failed
+	RunStatus    string `json:"run_status"`          // Runtime status: running, stopped, error, starting
+	ListenPort   uint16 `json:"listen_port"`         // Actual listening port
+	ListenIP     string `json:"listen_ip,omitempty"` // Actual listening IP; empty means all addresses
+	Connections  int    `json:"connections"`         // Current number of connections
+	ErrorMessage string `json:"error_message"`       // Error message if any
+	SyncedAt     int64  `json:"synced_at"`           // Last sync timestamp (Unix seconds)
 }
 
 // Rule sync status constants.
@@ -454,11 +456,11 @@ const (
 // Entry agents periodically check tunnel connectivity to exit agents and report failures.
 // Used with MsgTypeTunnelHealthReport message type via HubConn.SendTunnelHealthReport().
 type TunnelHealthReport struct {
-	RuleID      string `json:"rule_id"`                // Rule ID (Stripe-style prefixed, e.g., "fr_xxx")
-	ExitAgentID string `json:"exit_agent_id"`          // Exit agent ID (Stripe-style prefixed, e.g., "fa_xxx")
-	Healthy     bool   `json:"healthy"`                // Whether the tunnel is healthy
-	FailCount   int    `json:"fail_count,omitempty"`   // Consecutive failure count (when unhealthy)
-	Error       string `json:"error,omitempty"`        // Error message (when unhealthy)
-	LatencyMs   *int64 `json:"latency_ms,omitempty"`   // Last measured latency in milliseconds (when healthy)
-	CheckedAt   int64  `json:"checked_at"`             // Health check timestamp (Unix seconds)
+	RuleID      string `json:"rule_id"`              // Rule ID (Stripe-style prefixed, e.g., "fr_xxx")
+	ExitAgentID string `json:"exit_agent_id"`        // Exit agent ID (Stripe-style prefixed, e.g., "fa_xxx")
+	Healthy     bool   `json:"healthy"`              // Whether the tunnel is healthy
+	FailCount   int    `json:"fail_count,omitempty"` // Consecutive failure count (when unhealthy)
+	Error       string `json:"error,omitempty"`      // Error message (when unhealthy)
+	LatencyMs   *int64 `json:"latency_ms,omitempty"` // Last measured latency in milliseconds (when healthy)
+	CheckedAt   int64  `json:"checked_at"`           // Health check timestamp (Unix seconds)
 }

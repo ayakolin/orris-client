@@ -396,6 +396,7 @@ func (a *Agent) collectRuleSyncStatus() []forward.RuleSyncStatusItem {
 		}
 		// Get dynamic data from forwarder if available
 		if f, ok := a.forwarders[ruleID]; ok {
+			item.ListenIP = f.ListenIP()
 			item.ListenPort = f.ListenPort()
 			item.Connections = f.Connections()
 		}

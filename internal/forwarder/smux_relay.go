@@ -94,6 +94,11 @@ func (f *SmuxRelayForwarder) RuleID() string {
 	return f.rule.ID
 }
 
+// ListenIP returns empty because SmuxRelayForwarder does not listen locally.
+func (f *SmuxRelayForwarder) ListenIP() string {
+	return ""
+}
+
 // ListenPort returns 0 as SmuxRelayForwarder does not have a listening port.
 func (f *SmuxRelayForwarder) ListenPort() uint16 {
 	return 0
@@ -260,6 +265,11 @@ func (f *SmuxBoundaryRelayForwarder) Traffic() *TrafficCounter {
 // RuleID returns the rule ID.
 func (f *SmuxBoundaryRelayForwarder) RuleID() string {
 	return f.rule.ID
+}
+
+// ListenIP returns empty because SmuxBoundaryRelayForwarder does not listen locally.
+func (f *SmuxBoundaryRelayForwarder) ListenIP() string {
+	return ""
 }
 
 // ListenPort returns 0 as SmuxBoundaryRelayForwarder does not have a listening port.

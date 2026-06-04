@@ -91,6 +91,11 @@ func (f *SmuxExitForwarder) RuleID() string {
 	return f.rule.ID
 }
 
+// ListenIP returns empty because SmuxExitForwarder does not listen locally.
+func (f *SmuxExitForwarder) ListenIP() string {
+	return ""
+}
+
 // ListenPort returns 0 as SmuxExitForwarder does not have a listening port.
 func (f *SmuxExitForwarder) ListenPort() uint16 {
 	return 0

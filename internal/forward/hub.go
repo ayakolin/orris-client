@@ -267,6 +267,7 @@ type RuleSyncData struct {
 	ShortID                string   `json:"short_id"` // Deprecated: use ID instead
 	RuleType               string   `json:"rule_type"`
 	ListenPort             uint16   `json:"listen_port"`
+	ListenIP               string   `json:"listen_ip,omitempty"`
 	TargetAddress          string   `json:"target_address,omitempty"`
 	TargetPort             uint16   `json:"target_port,omitempty"`
 	BindIP                 string   `json:"bind_ip,omitempty"` // Bind IP address for outbound connections
