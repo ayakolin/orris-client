@@ -556,6 +556,10 @@ uninstall_one_resources() {
         print_info "Removing config ${CONFIG_FILE}..."
         rm -f "$CONFIG_FILE"
     fi
+    if [ -f "${CONFIG_FILE}.rules_cache.json" ]; then
+        print_info "Removing rule cache ${CONFIG_FILE}.rules_cache.json..."
+        rm -f "${CONFIG_FILE}.rules_cache.json"
+    fi
     if [ -f "$LOG_FILE" ]; then
         print_info "Removing log ${LOG_FILE}..."
         rm -f "$LOG_FILE"
