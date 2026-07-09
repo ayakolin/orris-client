@@ -66,6 +66,10 @@ func Load() (*Snapshot, error) {
 // Save atomically writes the snapshot to the rule cache file (temp file +
 // rename). The file is written with 0600 permissions since it may contain a
 // client token.
+//
+// Note: Save() is not concurrent-safe. The caller must ensure that only one
+// goroutine calls Save() at a time (e.g., via a single-goroutine debounce
+// routine).
 func Save(snap *Snapshot) error {
 	path := FilePath()
 
@@ -87,11 +91,41 @@ func Save(snap *Snapshot) error {
 	}
 
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	// Use O_EXCL to prevent following symlinks that may have been placed at tmpPath
+	// by an attacker. If tmpPath exists (including as a symlink), this will fail
+	// with EEXIST rather than following the link.
+	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		// If the temp file already exists, check if it's a symlink (security issue)
+		// or just a leftover from a previous failed Save().
+		if os.IsExist(err) {
+			info, statErr := os.Lstat(tmpPath)
+			if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+				// It's a symlink at the temp path, which is a security issue. Reject it.
+				return fmt.Errorf("create temp rule cache: %w", err)
+			}
+			// It's not a symlink, so clean it up and retry once.
+			os.Remove(tmpPath)
+			tmpFile, err = os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		}
+		if err != nil {
+			return fmt.Errorf("create temp rule cache: %w", err)
+		}
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("write temp rule cache: %w", err)
 	}
 
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp rule cache: %w", err)
+	}
+
 	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
 		return fmt.Errorf("rename rule cache: %w", err)
 	}
 

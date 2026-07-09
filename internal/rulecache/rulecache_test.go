@@ -141,3 +141,31 @@ func TestSaveFilePermissions(t *testing.T) {
 		t.Errorf("file permissions = %o, want 0600", perm)
 	}
 }
+
+func TestSaveRejectsSymlinkAtTempPath(t *testing.T) {
+	setConfigFile(t)
+
+	// Pre-create the temp file path as a symlink to an arbitrary target.
+	target := FilePath() + ".attacker-target"
+	if err := os.WriteFile(target, []byte("do not overwrite me"), 0600); err != nil {
+		t.Fatalf("setup write: %v", err)
+	}
+	tmpPath := FilePath() + ".tmp"
+	if err := os.Symlink(target, tmpPath); err != nil {
+		t.Fatalf("setup symlink: %v", err)
+	}
+
+	err := Save(&Snapshot{Rules: []forward.Rule{{ID: "fr_1"}}, SavedAt: 1})
+	if err == nil {
+		t.Fatal("Save() error = nil, want error when temp path is a pre-existing symlink")
+	}
+
+	// The attacker's target file must remain untouched.
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("read target: %v", readErr)
+	}
+	if string(got) != "do not overwrite me" {
+		t.Errorf("attacker target was overwritten: got %q", string(got))
+	}
+}
