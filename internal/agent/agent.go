@@ -115,7 +115,10 @@ func (a *Agent) Start(ctx context.Context) error {
 	a.ctx, a.cancelFn = context.WithCancel(ctx)
 
 	if err := a.syncRules(); err != nil {
-		return fmt.Errorf("initial sync failed: %w", err)
+		logger.Warn("initial sync failed, falling back to local rule cache", "error", err)
+		if cacheErr := a.startFromCache(); cacheErr != nil {
+			return fmt.Errorf("initial sync failed (%v) and no usable rule cache available (%w)", err, cacheErr)
+		}
 	}
 
 	a.wg.Add(5)
