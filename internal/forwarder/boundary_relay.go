@@ -162,7 +162,7 @@ func (f *BoundaryRelayForwarder) HandleConnect(connID uint64) {
 		return
 	}
 
-	dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
+	dialer := &net.Dialer{Timeout: targetDialTimeout}
 	if f.rule.BindIP != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
 	}

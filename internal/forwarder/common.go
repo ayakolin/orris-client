@@ -176,6 +176,13 @@ const maxBatchSize = 128
 // This provides backpressure to upstream without immediately failing.
 const writeTimeout = 5 * time.Second
 
+// targetDialTimeout is the maximum time to wait when dialing a forward
+// target. Cross-region/public-internet routes routinely see TCP handshakes
+// take several hundred ms, and any single dropped SYN adds a retransmit
+// RTO (~1s) on top of that; a sub-second budget turns ordinary latency
+// jitter into spurious circuit-breaker trips.
+const targetDialTimeout = 5 * time.Second
+
 // ErrQueueFull is returned when the write queue is full.
 var ErrQueueFull = errors.New("write queue full")
 

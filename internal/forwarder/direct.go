@@ -226,7 +226,7 @@ func (f *DirectForwarder) handleTCPConn(clientConn net.Conn) {
 
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
 
-	dialer := &net.Dialer{Timeout: 500 * time.Millisecond}
+	dialer := &net.Dialer{Timeout: targetDialTimeout}
 	if f.rule.BindIP != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
 	}
