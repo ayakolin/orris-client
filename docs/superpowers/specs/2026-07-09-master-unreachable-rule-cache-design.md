@@ -89,11 +89,13 @@ statusLoop / ruleStatusReportLoop / cachePersistLoop
 func (a *Agent) getExitEndpoint(agentID string) (*forward.ExitEndpoint, error)
 ```
 
-`internal/agent/tunnel_manager.go` 中原本 4 处直接调用 `a.client.GetExitEndpoint(...)` 的地方统一改为调用 `a.getExitEndpoint(...)`：
+`internal/agent/tunnel_manager.go` 中原本 6 处直接调用 `a.client.GetExitEndpoint(...)` 的地方统一改为调用 `a.getExitEndpoint(...)`：
 - `getOrCreateTunnel`（单出口 entry）
 - `getOrCreateTunnels` 循环（多出口负载均衡 entry）
+- `createWSClient` 的 endpoint refresher 闭包（失败 3 次后触发的重连刷新）
+- `createTLSClient` 的 endpoint refresher 闭包（失败 3 次后触发的重连刷新）
+- `createSmuxClient` 的 endpoint refresher 闭包（失败 3 次后触发的重连刷新）
 - `getOrCreateSmuxClient`（SMUX entry）
-- SMUX 客户端的 endpoint refresher 闭包（`createSmuxClient` 内部，失败 3 次后触发的重连刷新）
 
 **明确不覆盖的范围**：chain/relay 隧道运行中失败重连所用的 `RefreshRule`（而非 `GetExitEndpoint`）刷新闭包（`createWSClientByAddress` / `createTLSClientByAddress` / `createSmuxClientByAddress` 内部）。这些规则本身因为已经把 `NextHopAddress` 直接写在 `Rule` 里，首次建道天然不需要主控机；只有"已建立的隧道失败后触发的重新刷新"这一条边缘路径依赖主控机，且 `RefreshRule` 返回的是完整 Rule（语义比端点复杂得多），本次不做缓存兜底，维持现状（按原有退避策略持续重试）。
 
