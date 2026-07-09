@@ -53,6 +53,12 @@ type Agent struct {
 	tunnelsMu sync.RWMutex
 	tunnels   map[string]tunnel.TunnelClient // ruleID -> tunnel (WS or TLS)
 
+	// Cache of resolved exit agent endpoints. Used as a fallback when the
+	// control server is unreachable and a new tunnel needs to be established
+	// (see getExitEndpoint).
+	endpointCacheMu sync.RWMutex
+	endpointCache   map[string]forward.ExitEndpoint // agentID -> last resolved endpoint
+
 	// Health check configurations for load balancing failover
 	healthCheckMu      sync.RWMutex
 	healthCheckConfigs map[string]*forward.HealthCheckConfig // ruleID -> config
@@ -98,6 +104,7 @@ func New(cfg *config.Config) *Agent {
 		collector:          status.NewCollector(),
 		forwarders:         make(map[string]forwarder.Forwarder),
 		tunnels:            make(map[string]tunnel.TunnelClient),
+		endpointCache:      make(map[string]forward.ExitEndpoint),
 		healthCheckConfigs: make(map[string]*forward.HealthCheckConfig),
 		ruleStatus:         make(map[string]*ruleStatus),
 		ruleStatusReportCh: make(chan struct{}, 1), // buffered to avoid blocking
