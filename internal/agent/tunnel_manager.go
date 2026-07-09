@@ -56,7 +56,7 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (tunnel.TunnelClient, erro
 		return nil, fmt.Errorf("no exit agent ID specified")
 	}
 
-	endpoint, err := a.client.GetExitEndpoint(a.ctx, agentID)
+	endpoint, err := a.getExitEndpoint(agentID)
 	if err != nil {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
@@ -89,7 +89,7 @@ func (a *Agent) getOrCreateTunnels(rule *forward.Rule) ([]tunnel.TunnelClient, [
 	weights := make([]uint16, 0, len(rule.ExitAgents))
 
 	for _, agent := range rule.ExitAgents {
-		endpoint, err := a.client.GetExitEndpoint(a.ctx, agent.AgentID)
+		endpoint, err := a.getExitEndpoint(agent.AgentID)
 		if err != nil {
 			// Clean up already created tunnels on error
 			for _, t := range tunnels {
@@ -171,7 +171,7 @@ func (a *Agent) createWSClient(rule *forward.Rule, address string, port uint16, 
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
-		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
+		ep, err := a.getExitEndpoint(agentID)
 		if err != nil {
 			return "", "", err
 		}
@@ -202,7 +202,7 @@ func (a *Agent) createTLSClient(rule *forward.Rule, address string, port uint16,
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
-		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
+		ep, err := a.getExitEndpoint(agentID)
 		if err != nil {
 			return "", "", err
 		}
@@ -459,7 +459,7 @@ func (a *Agent) createSmuxClient(rule *forward.Rule, address string, port uint16
 
 	// Create endpoint refresher
 	refresher := func() (string, string, error) {
-		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
+		ep, err := a.getExitEndpoint(agentID)
 		if err != nil {
 			return "", "", err
 		}
@@ -500,7 +500,7 @@ func (a *Agent) getOrCreateSmuxClient(rule *forward.Rule) (tunnel.SmuxTunnelClie
 		return nil, fmt.Errorf("no exit agent ID specified")
 	}
 
-	endpoint, err := a.client.GetExitEndpoint(a.ctx, agentID)
+	endpoint, err := a.getExitEndpoint(agentID)
 	if err != nil {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
