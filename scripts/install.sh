@@ -556,6 +556,7 @@ uninstall_one_resources() {
         print_info "Removing config ${CONFIG_FILE}..."
         rm -f "$CONFIG_FILE"
     fi
+    # ".rules_cache.json" must stay in sync with cacheSuffix in internal/rulecache/rulecache.go
     if [ -f "${CONFIG_FILE}.rules_cache.json" ]; then
         print_info "Removing rule cache ${CONFIG_FILE}.rules_cache.json..."
         rm -f "${CONFIG_FILE}.rules_cache.json"
