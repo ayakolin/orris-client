@@ -237,6 +237,12 @@ create_config() {
 # Orris Client Configuration (instance: ${INSTANCE:-default})
 ORRIS_SERVER_URL=${server}
 ORRIS_TOKEN=${token}
+# Tells the agent its own config file path, so instance-scoped state
+# (e.g. the rule cache) doesn't collide across multiple instances on
+# the same host. systemd's EnvironmentFile= and OpenRC's start_pre()
+# both load this file's KEY=VALUE lines into the process environment,
+# so this line is picked up automatically without further wiring.
+ORRIS_CONFIG_FILE=${CONFIG_FILE}
 EOF
 
     [ -n "$ws_port" ]  && echo "ORRIS_WS_LISTEN_PORT=${ws_port}"  >> "$CONFIG_FILE"
