@@ -224,3 +224,67 @@ func TestStartFailsWhenSyncFailsAndNoCache(t *testing.T) {
 		t.Fatal("Start() error = nil, want error when sync fails and no cache exists")
 	}
 }
+
+func TestWriteRuleCachePersistsCurrentState(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ORRIS_CONFIG_FILE", filepath.Join(dir, "client.env"))
+
+	a := New(config.DefaultConfig())
+	a.rulesMu.Lock()
+	a.rules = []forward.Rule{{ID: "fr_1", RuleType: forward.RuleTypeDirect}}
+	a.clientToken = "fwd_token"
+	a.blockedProtocols = []string{"udp"}
+	a.rulesMu.Unlock()
+	a.endpointCacheMu.Lock()
+	a.endpointCache["fa_1"] = forward.ExitEndpoint{Address: "1.1.1.1", WsPort: 100}
+	a.endpointCacheMu.Unlock()
+
+	a.writeRuleCache()
+
+	snap, err := rulecache.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(snap.Rules) != 1 || snap.Rules[0].ID != "fr_1" {
+		t.Fatalf("Rules = %+v, want 1 rule fr_1", snap.Rules)
+	}
+	if snap.ClientToken != "fwd_token" {
+		t.Errorf("ClientToken = %q, want fwd_token", snap.ClientToken)
+	}
+	ep, ok := snap.Endpoints["fa_1"]
+	if !ok || ep.Address != "1.1.1.1" {
+		t.Errorf("Endpoints[fa_1] = %+v, ok=%v, want cached entry", ep, ok)
+	}
+}
+
+func TestCachePersistLoopWritesOnSignal(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ORRIS_CONFIG_FILE", filepath.Join(dir, "client.env"))
+
+	a := New(config.DefaultConfig())
+	a.rulesMu.Lock()
+	a.rules = []forward.Rule{{ID: "fr_async", RuleType: forward.RuleTypeDirect}}
+	a.rulesMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.ctx = ctx
+	a.wg.Add(1)
+	go a.cachePersistLoop()
+
+	a.persistRuleCache()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if snap, err := rulecache.Load(); err == nil && len(snap.Rules) == 1 && snap.Rules[0].ID == "fr_async" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("cache file was not written within timeout")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	a.wg.Wait()
+}

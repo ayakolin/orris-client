@@ -337,6 +337,8 @@ func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
 		}
 	}
 
+	a.persistRuleCache()
+
 	return nil
 }
 
@@ -427,6 +429,8 @@ func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
 
 	// Update rules list
 	a.updateRulesList(data)
+
+	a.persistRuleCache()
 
 	return nil
 }

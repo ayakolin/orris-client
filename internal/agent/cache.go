@@ -57,6 +57,7 @@ func (a *Agent) getExitEndpoint(agentID string) (*forward.ExitEndpoint, error) {
 		a.endpointCacheMu.Lock()
 		a.endpointCache[agentID] = *endpoint
 		a.endpointCacheMu.Unlock()
+		a.persistRuleCache()
 		return endpoint, nil
 	}
 
@@ -71,4 +72,73 @@ func (a *Agent) getExitEndpoint(agentID string) (*forward.ExitEndpoint, error) {
 	logger.Warn("control server unreachable, using cached exit endpoint",
 		"agent_id", agentID, "address", cached.Address, "error", err)
 	return &cached, nil
+}
+
+// cachePersistDebounceInterval coalesces rapid successive cache-persist
+// requests (e.g. during a burst of incremental syncs) into a single disk write.
+const cachePersistDebounceInterval = 200 * time.Millisecond
+
+// persistRuleCache signals the debounce goroutine to persist the current rule
+// state. Non-blocking: if a persist is already pending, this is a no-op.
+func (a *Agent) persistRuleCache() {
+	select {
+	case a.cachePersistCh <- struct{}{}:
+	default:
+	}
+}
+
+// cachePersistLoop is a debounced loop that writes the rule cache to disk.
+// It coalesces multiple rapid persist requests into a single disk write.
+func (a *Agent) cachePersistLoop() {
+	defer a.wg.Done()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.cachePersistCh:
+			time.Sleep(cachePersistDebounceInterval)
+
+			for {
+				select {
+				case <-a.cachePersistCh:
+				default:
+					goto write
+				}
+			}
+		write:
+			a.writeRuleCache()
+		}
+	}
+}
+
+// writeRuleCache builds a snapshot of the current rule state and saves it to
+// disk. Persistence is best-effort: failures are logged but do not affect
+// agent operation.
+func (a *Agent) writeRuleCache() {
+	a.rulesMu.RLock()
+	rules := make([]forward.Rule, len(a.rules))
+	copy(rules, a.rules)
+	clientToken := a.clientToken
+	blockedProtocols := a.blockedProtocols
+	a.rulesMu.RUnlock()
+
+	a.endpointCacheMu.RLock()
+	endpoints := make(map[string]forward.ExitEndpoint, len(a.endpointCache))
+	for id, ep := range a.endpointCache {
+		endpoints[id] = ep
+	}
+	a.endpointCacheMu.RUnlock()
+
+	snap := &rulecache.Snapshot{
+		Rules:            rules,
+		ClientToken:      clientToken,
+		BlockedProtocols: blockedProtocols,
+		Endpoints:        endpoints,
+		SavedAt:          time.Now().Unix(),
+	}
+
+	if err := rulecache.Save(snap); err != nil {
+		logger.Warn("failed to persist rule cache", "error", err)
+	}
 }

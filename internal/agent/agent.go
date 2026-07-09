@@ -90,6 +90,10 @@ type Agent struct {
 	// A single goroutine drains and coalesces multiple updates
 	ruleStatusReportCh chan struct{}
 
+	// Debounce channel for local rule-cache persistence.
+	// Signaled after every successful sync so the on-disk cache stays fresh.
+	cachePersistCh chan struct{}
+
 	ctx      context.Context
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup
@@ -108,6 +112,7 @@ func New(cfg *config.Config) *Agent {
 		healthCheckConfigs: make(map[string]*forward.HealthCheckConfig),
 		ruleStatus:         make(map[string]*ruleStatus),
 		ruleStatusReportCh: make(chan struct{}, 1), // buffered to avoid blocking
+		cachePersistCh:     make(chan struct{}, 1), // buffered to avoid blocking
 	}
 }
 
@@ -121,12 +126,13 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
-	a.wg.Add(5)
+	a.wg.Add(6)
 	go a.syncLoop()
 	go a.trafficLoop()
 	go a.statusLoop()
 	go a.hubLoop()
 	go a.ruleStatusReportLoop()
+	go a.cachePersistLoop()
 
 	return nil
 }

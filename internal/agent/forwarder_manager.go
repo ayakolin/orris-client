@@ -155,6 +155,8 @@ func (a *Agent) syncRules() error {
 		}
 	}
 
+	a.persistRuleCache()
+
 	return nil
 }
 
